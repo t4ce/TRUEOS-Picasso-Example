@@ -1,0 +1,4 @@
+[env]
+# Keep this standalone Blueprint on the canonical native TRUEOS target spec.
+# Cargo exports the relative value from the project root.
+TRUEOS_BLUEPRINT_TARGET_SPEC = { value = "../TRUEOS-Blueprints/apps/target.json", relative = true }

@@ -1,0 +1,21 @@
+[package]
+name = "picasso-example"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[package.metadata.trueos-blueprint]
+replicatable = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "picasso-example"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+trueos = { path = "../TRUEOS-Blueprints/api" }
+trueos-picasso = { path = "../TRUEOS-Picasso", default-features = false }
