@@ -1,6 +1,7 @@
 #![no_std]
 
 use trueos::{
+    clock,
     logl::{self, level},
     vsys,
 };
@@ -21,22 +22,30 @@ fn main() {
     logl::log(
         level::INFO,
         format_args!(
-            "PicassoExample: DamagedHelmet + RGB line-list batch submitted and retired: vertices={} indices={} timeline={}",
+            "PicassoExample: retained DamagedHelmet instances + static RGB lines submitted and retired: vertices={} indices={} timeline={}",
             HELMET_VERTEX_COUNT,
             HELMET_INDEX_COUNT,
             probe.timeline(),
         ),
     );
 
+    let start = clock::monotonic_millis();
     let mut presentation_logged = false;
     loop {
         vsys::poll_once();
+        if let Err(error) = probe.render_frame(clock::monotonic_millis().saturating_sub(start)) {
+            logl::log(
+                level::ERROR,
+                format_args!("PicassoExample: retained animation failed: {error:?}"),
+            );
+            return;
+        }
         if !presentation_logged {
             match probe.take_first_presentation() {
                 Ok(true) => {
                     logl::log(
                         level::INFO,
-                        "PicassoExample: mixed triangle/line geometry crossed UI4 SURFLIVE",
+                        "PicassoExample: retained transform + static line frame crossed UI4 SURFLIVE",
                     );
                     presentation_logged = true;
                 }

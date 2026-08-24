@@ -9,8 +9,8 @@ use trueos::ui4_scene::{Damage, Frame};
 #[cfg(target_os = "trueos")]
 use trueos::vgpu::{
     BUFFER_USAGE_INDEX, BUFFER_USAGE_MAP_WRITE, BUFFER_USAGE_VERTEX, Buffer, BufferSlice,
-    Capabilities, Device, IndexedBatchDrawV2, IndexedDrawBatchV2, Queue, QueueClass,
-    RenderPipeline, SHADER_PACKAGE_CLIP_POSITION3_IMMEDIATE_RGBA_FNV1A64, VVideoMem,
+    Capabilities, Device, IndexedBatchDrawV2, Queue, QueueClass, RetainedFrameSubmit,
+    RetainedMesh, RetainedMeshDescriptor, RetainedTransformSeed, VVideoMem,
 };
 #[cfg(any(test, target_os = "trueos"))]
 use trueos_picasso::ExecRing;
@@ -41,6 +41,11 @@ pub static HELMET_TRANSFORM_REFS_U32: &[u8; 16] = &[
 
 pub static HELMET_POSITIONS: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/damaged_helmet.positions.f32le"));
+/// Authenticated Helio native-matrix input: Float3 position followed by Float3
+/// normal. This remains one immutable geometry copy; the GPU transform pass
+/// supplies all four instance matrices separately.
+pub static HELMET_POSNORMAL: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/damaged_helmet.posnormal.f32le"));
 pub static HELMET_INDICES_U32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/damaged_helmet.indices.u32le"));
 
@@ -204,11 +209,13 @@ pub const fn head_transform_refs(
 #[cfg(target_os = "trueos")]
 pub struct GeometryProbe {
     frame: Frame,
-    _device: Device,
-    _queue: Queue,
-    _vertex_buffer: Buffer,
-    _index_buffer: Buffer,
-    _pipeline: RenderPipeline,
+    device: Device,
+    queue: Queue,
+    _helmet_vertex_buffer: Buffer,
+    _helmet_index_buffer: Buffer,
+    line_vertex_buffer: Buffer,
+    line_index_buffer: Buffer,
+    retained_mesh: RetainedMesh,
     timeline: u64,
 }
 
@@ -237,93 +244,106 @@ impl GeometryProbe {
         let queue = device
             .create_queue(QueueClass::Render)
             .map_err(|code| GeometryProbeError::Vgpu("queue-create", code))?;
-        let vertex_buffer = device
+        let helmet_vertex_buffer = device
             .create_buffer(
-                primitive.vertices.byte_length as usize
-                    + core::mem::size_of_val(&RGB_LINE_VERTICES),
+                HELMET_POSNORMAL_BYTES as usize,
                 BUFFER_USAGE_MAP_WRITE | BUFFER_USAGE_VERTEX,
             )
-            .map_err(|code| GeometryProbeError::Vgpu("vertex-buffer-create", code))?;
-        let index_buffer = device
+            .map_err(|code| GeometryProbeError::Vgpu("helmet-vertex-buffer-create", code))?;
+        let helmet_index_buffer = device
             .create_buffer(
-                indices.byte_length as usize + core::mem::size_of_val(&RGB_LINE_INDICES),
+                indices.byte_length as usize,
                 BUFFER_USAGE_MAP_WRITE | BUFFER_USAGE_INDEX,
             )
-            .map_err(|code| GeometryProbeError::Vgpu("index-buffer-create", code))?;
+            .map_err(|code| GeometryProbeError::Vgpu("helmet-index-buffer-create", code))?;
+        let line_vertex_buffer = device
+            .create_buffer(
+                core::mem::size_of_val(&RGB_LINE_VERTICES),
+                BUFFER_USAGE_MAP_WRITE | BUFFER_USAGE_VERTEX,
+            )
+            .map_err(|code| GeometryProbeError::Vgpu("line-vertex-buffer-create", code))?;
+        let line_index_buffer = device
+            .create_buffer(
+                core::mem::size_of_val(&RGB_LINE_INDICES),
+                BUFFER_USAGE_MAP_WRITE | BUFFER_USAGE_INDEX,
+            )
+            .map_err(|code| GeometryProbeError::Vgpu("line-index-buffer-create", code))?;
 
-        write_exact(
-            device,
-            vertex_buffer,
-            primitive.vertices.offset,
-            HELMET_POSITIONS,
-        )
-        .map_err(|code| GeometryProbeError::Vgpu("vertex-upload", code))?;
-        write_exact(device, index_buffer, indices.offset, HELMET_INDICES_U32)
-            .map_err(|code| GeometryProbeError::Vgpu("index-upload", code))?;
-        write_exact(
-            device,
-            vertex_buffer,
-            primitive.vertices.byte_length,
-            line_vertex_bytes(),
-        )
+        write_exact(device, helmet_vertex_buffer, 0, HELMET_POSNORMAL)
+            .map_err(|code| GeometryProbeError::Vgpu("helmet-posnormal-upload", code))?;
+        write_exact(device, helmet_index_buffer, 0, HELMET_INDICES_U32)
+            .map_err(|code| GeometryProbeError::Vgpu("helmet-index-upload", code))?;
+        write_exact(device, line_vertex_buffer, 0, line_vertex_bytes())
         .map_err(|code| GeometryProbeError::Vgpu("line-vertex-upload", code))?;
-        write_exact(
-            device,
-            index_buffer,
-            indices.byte_length,
-            line_index_bytes(),
-        )
+        write_exact(device, line_index_buffer, 0, line_index_bytes())
         .map_err(|code| GeometryProbeError::Vgpu("line-index-upload", code))?;
 
-        let shader = device
-            .create_shader_module(SHADER_PACKAGE_CLIP_POSITION3_IMMEDIATE_RGBA_FNV1A64)
-            .map_err(|code| GeometryProbeError::Vgpu("shader-create", code))?;
-        let pipeline = device
-            .create_render_pipeline(shader, primitive.vertex_stride, 0)
-            .map_err(|code| GeometryProbeError::Vgpu("pipeline-create", code))?;
-        device
-            .destroy_shader_module(shader)
-            .map_err(|code| GeometryProbeError::Vgpu("shader-destroy", code))?;
-
-        frame
-            .begin_gpu_frame()
-            .map_err(|_| GeometryProbeError::Ui4("frame-begin"))?;
-        let surface = device
-            .acquire_ui4_surface(frame.window_id())
-            .map_err(|code| GeometryProbeError::Vgpu("surface-acquire", code))?;
-        let point = device
-            .submit_ui4_indexed_batch_v2(
-                queue,
-                surface,
-                pipeline,
-                vertex_buffer,
-                index_buffer,
-                IndexedDrawBatchV2 {
-                    vertex_offset: primitive.vertices.offset,
-                    index_offset: indices.offset,
-                    clear_rgba8_srgb: u32::from_le_bytes([15, 20, 38, 255]),
-                    draw_count: 4,
-                    draws: mixed_topology_draws(primitive.index_count, primitive.vertex_count),
-                    ..IndexedDrawBatchV2::default()
+        let retained_mesh = device
+            .create_retained_mesh(
+                helmet_vertex_buffer,
+                helmet_index_buffer,
+                RetainedMeshDescriptor {
+                    vertex_count: primitive.vertex_count,
+                    index_count: primitive.index_count,
+                    ..RetainedMeshDescriptor::default()
                 },
             )
-            .map_err(|code| GeometryProbeError::Vgpu("mixed-topology-submit-v2", code))?;
-        device
-            .wait(queue, point.value)
+            .map_err(|code| GeometryProbeError::Vgpu("retained-mesh-create", code))?;
+
+        let mut probe = Self {
+            frame,
+            device,
+            queue,
+            _helmet_vertex_buffer: helmet_vertex_buffer,
+            _helmet_index_buffer: helmet_index_buffer,
+            line_vertex_buffer,
+            line_index_buffer,
+            retained_mesh,
+            timeline: 0,
+        };
+        probe.render_frame(0)?;
+        Ok(probe)
+    }
+
+    /// Advance the compact transform state and render one complete frame.
+    /// Geometry remains resident; only these seeds and the UI4 lease vary.
+    pub fn render_frame(&mut self, elapsed_millis: u64) -> Result<(), GeometryProbeError> {
+        const WIDTH: u32 = 640;
+        const HEIGHT: u32 = 360;
+
+        self.frame
+            .begin_gpu_frame()
+            .map_err(|_| GeometryProbeError::Ui4("frame-begin"))?;
+        let surface = self
+            .device
+            .acquire_ui4_surface(self.frame.window_id())
+            .map_err(|code| GeometryProbeError::Vgpu("surface-acquire", code))?;
+        let point = self
+            .device
+            .submit_retained_frame(
+                self.queue,
+                surface,
+                self.retained_mesh,
+                self.line_vertex_buffer,
+                self.line_index_buffer,
+                RetainedFrameSubmit {
+                    clear_rgba8_srgb: u32::from_le_bytes([15, 20, 38, 255]),
+                    seed_count: HEAD_INSTANCE_COUNT,
+                    static_draw_count: 3,
+                    seeds: retained_seeds(elapsed_millis),
+                    static_draws: retained_line_draws(),
+                    ..RetainedFrameSubmit::default()
+                },
+            )
+            .map_err(|code| GeometryProbeError::Vgpu("retained-frame-submit", code))?;
+        self.device
+            .wait(self.queue, point.value)
             .map_err(|code| GeometryProbeError::Vgpu("timeline-wait", code))?;
-        frame
+        self.frame
             .publish(Damage::full(WIDTH, HEIGHT))
             .map_err(|_| GeometryProbeError::Ui4("frame-publish"))?;
-
-        Ok(Self {
-            frame,
-            _device: device,
-            _queue: queue,
-            _vertex_buffer: vertex_buffer,
-            _index_buffer: index_buffer,
-            _pipeline: pipeline,
-            timeline: point.value,
-        })
+        self.timeline = point.value;
+        Ok(())
     }
 
     pub const fn timeline(&self) -> u64 {
@@ -338,29 +358,52 @@ impl GeometryProbe {
 }
 
 #[cfg(target_os = "trueos")]
-fn mixed_topology_draws(
-    helmet_index_count: u32,
-    helmet_vertex_count: u32,
-) -> [IndexedBatchDrawV2; trueos::vgpu::MAX_INDEXED_BATCH_DRAWS] {
-    let mut draws = [IndexedBatchDrawV2::default(); trueos::vgpu::MAX_INDEXED_BATCH_DRAWS];
-    for (slot, planned) in mixed_topology_plan(helmet_index_count, helmet_vertex_count)
-        .into_iter()
-        .enumerate()
-    {
-        draws[slot] = IndexedBatchDrawV2 {
-            index_count: planned.index_count,
-            first_index: planned.first_index,
-            base_vertex: planned.base_vertex,
-            rgba8_srgb: planned.rgba8_srgb,
-            topology: match planned.topology {
-                PrimitiveTopology::LineList => trueos::vgpu::PRIMITIVE_TOPOLOGY_LINE_LIST,
-                PrimitiveTopology::TriangleList => trueos::vgpu::PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
-                _ => 0,
-            },
-            reserved: 0,
-        };
-    }
-    draws
+fn retained_line_draws() -> [IndexedBatchDrawV2; trueos::vgpu::MAX_RETAINED_STATIC_DRAWS] {
+    core::array::from_fn(|slot| IndexedBatchDrawV2 {
+        index_count: 2,
+        first_index: slot as u32 * 2,
+        base_vertex: slot as i32 * 2,
+        rgba8_srgb: u32::from_le_bytes(
+            [[255, 32, 32, 255], [32, 255, 32, 255], [32, 96, 255, 255]][slot],
+        ),
+        topology: trueos::vgpu::PRIMITIVE_TOPOLOGY_LINE_LIST,
+        reserved: 0,
+    })
+}
+
+#[cfg(target_os = "trueos")]
+fn retained_seeds(
+    elapsed_millis: u64,
+) -> [RetainedTransformSeed; trueos::vgpu::MAX_RETAINED_TRANSFORM_SEEDS] {
+    let seconds = elapsed_millis as f32 * 0.001;
+    let half_angle = core::f32::consts::FRAC_PI_4 * seconds;
+    let clockwise = [-0.0, 0.0, -libm::sinf(half_angle), libm::cosf(half_angle)];
+    let counter_clockwise = [0.0, 0.0, libm::sinf(half_angle), libm::cosf(half_angle)];
+    let half_cycle = (elapsed_millis % 1_000) as f32;
+    let pulse = libm::fabsf(half_cycle - 500.0) / 500.0;
+    let translations = [
+        [-0.5, 0.5, 0.0],
+        [0.5, 0.5, 0.0],
+        [-0.5, -0.5, 0.0],
+        [0.5, -0.5, 0.0],
+    ];
+    core::array::from_fn(|slot| RetainedTransformSeed {
+        translation: translations[slot],
+        scale: if slot == 2 {
+            [0.45 * pulse; 3]
+        } else {
+            [0.45; 3]
+        },
+        rotation: match slot {
+            0 => clockwise,
+            1 => counter_clockwise,
+            _ => [0.0, 0.0, 0.0, 1.0],
+        },
+        local_radius: 1.0,
+        previous_translation: translations[slot],
+        draw_group: 0,
+        flags: (slot as u32) << 16,
+    })
 }
 
 #[cfg(target_os = "trueos")]

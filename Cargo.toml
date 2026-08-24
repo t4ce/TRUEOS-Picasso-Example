@@ -20,6 +20,7 @@ test = false
 bench = false
 
 [dependencies]
+libm = "0.2"
 trueos = { path = "../TRUEOS-Blueprints/api" }
 trueos-picasso = { path = "../TRUEOS-Picasso", default-features = false }
 

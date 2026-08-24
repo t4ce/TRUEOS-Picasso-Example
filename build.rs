@@ -11,6 +11,7 @@ fn main() {
         .next()
         .expect("DamagedHelmet must contain a mesh");
     let mut positions = Vec::<[f32; 3]>::new();
+    let mut normals = Vec::<[f32; 3]>::new();
     let mut indices = Vec::<u32>::new();
 
     for primitive in mesh.primitives() {
@@ -28,6 +29,15 @@ fn main() {
             .read_positions()
             .expect("DamagedHelmet primitive must contain POSITION")
             .collect::<Vec<_>>();
+        let primitive_normals = reader
+            .read_normals()
+            .expect("DamagedHelmet primitive must contain NORMAL")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            primitive_normals.len(),
+            primitive_positions.len(),
+            "POSITION/NORMAL accessor counts must match"
+        );
         let primitive_indices = reader
             .read_indices()
             .map(|values| values.into_u32().collect::<Vec<_>>())
@@ -36,6 +46,7 @@ fn main() {
                     .collect()
             });
         positions.extend(primitive_positions);
+        normals.extend(primitive_normals);
         indices.extend(
             primitive_indices
                 .into_iter()
@@ -44,6 +55,7 @@ fn main() {
     }
 
     assert!(!positions.is_empty(), "DamagedHelmet mesh has no vertices");
+    assert_eq!(normals.len(), positions.len(), "every position has one normal");
     assert!(!indices.is_empty(), "DamagedHelmet mesh has no indices");
     assert_eq!(indices.len() % 3, 0, "indices must form triangles");
     normalize_to_clip_space(&mut positions);
@@ -54,6 +66,16 @@ fn main() {
             vertex_bytes.extend_from_slice(&component.to_le_bytes());
         }
     }
+    let mut posnormal_bytes = Vec::with_capacity(positions.len() * 24);
+    for (position, normal) in positions.iter().zip(&normals) {
+        assert!(
+            normal.iter().all(|component| component.is_finite()),
+            "mesh normals must be finite"
+        );
+        for component in position.iter().chain(normal) {
+            posnormal_bytes.extend_from_slice(&component.to_le_bytes());
+        }
+    }
     let mut index_bytes = Vec::with_capacity(indices.len() * 4);
     for index in &indices {
         index_bytes.extend_from_slice(&index.to_le_bytes());
@@ -62,6 +84,11 @@ fn main() {
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set"));
     fs::write(out.join("damaged_helmet.positions.f32le"), &vertex_bytes)
         .expect("write prepared positions");
+    fs::write(
+        out.join("damaged_helmet.posnormal.f32le"),
+        &posnormal_bytes,
+    )
+    .expect("write prepared position/normal vertices");
     fs::write(out.join("damaged_helmet.indices.u32le"), &index_bytes)
         .expect("write prepared indices");
     fs::write(
@@ -70,10 +97,12 @@ fn main() {
             "pub const HELMET_VERTEX_COUNT: u32 = {};\n\
              pub const HELMET_INDEX_COUNT: u32 = {};\n\
              pub const HELMET_VERTEX_BYTES: u64 = {};\n\
+             pub const HELMET_POSNORMAL_BYTES: u64 = {};\n\
              pub const HELMET_INDEX_BYTES: u64 = {};\n",
             positions.len(),
             indices.len(),
             vertex_bytes.len(),
+            posnormal_bytes.len(),
             index_bytes.len(),
         ),
     )

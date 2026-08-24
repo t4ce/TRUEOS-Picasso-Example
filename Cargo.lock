@@ -288,6 +288,7 @@ name = "trueos-picasso-example"
 version = "0.1.0"
 dependencies = [
  "gltf",
+ "libm",
  "trueos",
  "trueos-picasso",
 ]
