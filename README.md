@@ -9,7 +9,7 @@ sysroot, ABI guard, and packaging path are applied:
 
 ```sh
 cd ../TRUEOS-Blueprints
-cargo run -- ../PicassoExample
+cargo run -- ../TRUEOS-Picasso-Example
 ```
 
 The packer must be launched from the Blueprint repository so its canonical
@@ -17,8 +17,41 @@ vendor overlays are available to the native TRUEOS build.
 
 This is a genuinely `#![no_std]` consumer of `trueos-picasso` with its default
 host feature disabled. It demonstrates the runtime boundary: already-prepared
-Dealer resources are mapped into shared DDR5, CPU code writes an available ring
-generation, then the executor owns that generation until its GPU timeline retires.
+Dealer resources are materialized as opaque vGPU buffers in shared DDR5.
+Picasso carries only `SharedResourceId` and byte offsets; it never receives a
+GPU virtual address. `VVideoRing` owns `VVideoMem` after its `ExecRing` field,
+so the mapping outlives every ring view. Its visibility adapter uses
+`VVideoMem::flush` and `invalidate` with resource-relative offsets: it flushes
+the header plus payload, then flushes the published header control line. The
+header remains CPU-owned; after completion it invalidates only GPU-owned payload
+bytes, after reading the header metadata.
+
+The packaged binary also runs one end-to-end mixed-topology probe using the
+actual `DamagedHelmet.glb` geometry plus three red, green, and blue line-list
+primitives. `build.rs` performs the glTF accessor decode and
+normalizes its positions at host build time. The `#![no_std]` Blueprint embeds
+only prepared position and `u32` index bytes, maps their Picasso ranges to
+opaque vGPU buffers, submits the authenticated indexed-render pipeline to a
+UI4 surface, waits for its virtual timeline, publishes the frame, and logs when
+it crosses UI4's physical SURFLIVE handoff. A versioned indexed-batch contract
+keeps the helmet on native triangle-list topology and dispatches each colored
+segment as native line-list topology in the same render pass. The lines carry
+no transform references, proving that transform scope belongs to a draw rather
+than leaking into global render state. The current indexed broker accepts
+DMA-backed `Buffer`s; `VVideoMem` remains the shared guest-page backing for
+Cubism's execution ring.
+
+The retained-transform proof is intentionally single-geometry: four packed
+`TransformId` references select four 48-byte states while every draw continues
+to name the same DamagedHelmet vertex and index resources. The GPU animation
+program describes a clockwise top-left head, counter-clockwise top-right head,
+a bottom-left head that collapses to zero over 0.5 seconds and returns over the
+next 0.5 seconds, and an unchanged bottom-right head. All four start at 45%
+scale in their respective quadrants. The current vGPU indexed-render ABI does
+not yet bind this state table to a vertex shader; until that authenticated
+package and submission contract land, the runtime presentation remains one
+head plus the three topology-proof lines rather than fabricating four
+CPU-transformed vertex copies.
 
 There is no `std::fs`, glTF parser, redb backend, MASS filesystem adapter, or
 CLI in this build. Those are host-only Picasso features used before boot or by
