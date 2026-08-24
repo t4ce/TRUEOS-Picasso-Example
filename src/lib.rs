@@ -5,7 +5,9 @@
 #![no_std]
 
 #[cfg(target_os = "trueos")]
-use trueos::ui4_scene::{Damage, Frame};
+use trueos::ui4_scene::{
+    CursorIcon, CursorSource, Damage, Frame, POINTER_BUTTON_PRIMARY, output_dimensions,
+};
 #[cfg(target_os = "trueos")]
 use trueos::vgpu::{
     BUFFER_USAGE_INDEX, BUFFER_USAGE_MAP_WRITE, BUFFER_USAGE_VERTEX, Buffer, BufferSlice,
@@ -53,12 +55,12 @@ pub static HELMET_INDICES_U32: &[u8] =
 /// transform references: the mixed batch proves topology and transform scope
 /// are per draw rather than accidental global state.
 pub static RGB_LINE_VERTICES: [[f32; 3]; 6] = [
-    [-0.90, 0.85, 0.0],
-    [-0.50, 0.85, 0.0],
-    [-0.20, 0.85, 0.0],
-    [0.20, 0.85, 0.0],
-    [0.50, 0.85, 0.0],
-    [0.90, 0.85, 0.0],
+    [0.0, 0.0, 0.0],
+    [1.20, 0.0, 0.0],
+    [0.0, 0.0, 0.0],
+    [0.0, 1.20, 0.0],
+    [0.0, 0.0, 0.0],
+    [-0.848_528, -0.848_528, 0.0],
 ];
 pub static RGB_LINE_INDICES: [u32; 6] = [0, 1, 0, 1, 0, 1];
 
@@ -216,7 +218,18 @@ pub struct GeometryProbe {
     line_vertex_buffer: Buffer,
     line_index_buffer: Buffer,
     retained_mesh: RetainedMesh,
+    resize_drag: Option<ResizeDrag>,
     timeline: u64,
+}
+
+#[cfg(target_os = "trueos")]
+#[derive(Clone, Copy)]
+struct ResizeDrag {
+    source: CursorSource,
+    anchor_x: u32,
+    anchor_y: u32,
+    width: u32,
+    height: u32,
 }
 
 #[cfg(target_os = "trueos")]
@@ -299,6 +312,7 @@ impl GeometryProbe {
             line_vertex_buffer,
             line_index_buffer,
             retained_mesh,
+            resize_drag: None,
             timeline: 0,
         };
         probe.render_frame(0)?;
@@ -308,8 +322,9 @@ impl GeometryProbe {
     /// Advance the compact transform state and render one complete frame.
     /// Geometry remains resident; only these seeds and the UI4 lease vary.
     pub fn render_frame(&mut self, elapsed_millis: u64) -> Result<(), GeometryProbeError> {
-        const WIDTH: u32 = 640;
-        const HEIGHT: u32 = 360;
+        self.service_frame_interaction()?;
+        let width = self.frame.width();
+        let height = self.frame.height();
 
         self.frame
             .begin_gpu_frame()
@@ -340,9 +355,93 @@ impl GeometryProbe {
             .wait(self.queue, point.value)
             .map_err(|code| GeometryProbeError::Vgpu("timeline-wait", code))?;
         self.frame
-            .publish(Damage::full(WIDTH, HEIGHT))
+            .publish(Damage::full(width, height))
             .map_err(|_| GeometryProbeError::Ui4("frame-publish"))?;
         self.timeline = point.value;
+        Ok(())
+    }
+
+    /// Consume UI4's one-shot maximize/restore extent and the selected
+    /// frame's cursor-sized bottom-right resize grip. The grip has no pixels;
+    /// it is only a hit region fully contained in the application frame.
+    fn service_frame_interaction(&mut self) -> Result<(), GeometryProbeError> {
+        const RESIZE_GRIP_PX: i32 = 16;
+        const MIN_WIDTH: u32 = 160;
+        const MIN_HEIGHT: u32 = 90;
+
+        let mut requested_extent = None;
+        while let Some(event) = self
+            .frame
+            .take_resize_event()
+            .map_err(|_| GeometryProbeError::Ui4("resize-event"))?
+        {
+            requested_extent = Some((event.width, event.height));
+        }
+        if let Some((width, height)) = requested_extent
+            && (width != self.frame.width() || height != self.frame.height())
+        {
+            self.frame
+                .resize(width, height)
+                .map_err(|_| GeometryProbeError::Ui4("maximize-resize"))?;
+        }
+
+        let (output_width, output_height) =
+            output_dimensions().map_err(|_| GeometryProbeError::Ui4("output-extent"))?;
+        let mut drag = self.resize_drag;
+        let mut live_extent = None;
+        while let Some(event) = self
+            .frame
+            .take_pointer_event()
+            .map_err(|_| GeometryProbeError::Ui4("pointer-event"))?
+        {
+            let in_grip = event.local_x >= self.frame.width() as i32 - RESIZE_GRIP_PX
+                && event.local_y >= self.frame.height() as i32 - RESIZE_GRIP_PX
+                && event.local_x < self.frame.width() as i32
+                && event.local_y < self.frame.height() as i32;
+            let owns_drag = drag.is_some_and(|active| active.source == event.source);
+            self.frame
+                .set_cursor_icon_for(
+                    event.source,
+                    if in_grip || owns_drag {
+                        CursorIcon::ResizeDiagonal
+                    } else {
+                        CursorIcon::Default
+                    },
+                )
+                .map_err(|_| GeometryProbeError::Ui4("resize-cursor"))?;
+
+            if event.buttons_pressed & POINTER_BUTTON_PRIMARY != 0 && in_grip {
+                drag = Some(ResizeDrag {
+                    source: event.source,
+                    anchor_x: event.x,
+                    anchor_y: event.y,
+                    width: self.frame.width(),
+                    height: self.frame.height(),
+                });
+            }
+            if let Some(active) = drag
+                && active.source == event.source
+            {
+                let width = (i64::from(active.width) + i64::from(event.x) - i64::from(active.anchor_x))
+                    .clamp(i64::from(MIN_WIDTH), i64::from(output_width)) as u32;
+                let height = (i64::from(active.height) + i64::from(event.y) - i64::from(active.anchor_y))
+                    .clamp(i64::from(MIN_HEIGHT), i64::from(output_height)) as u32;
+                live_extent = Some((width, height));
+                if event.buttons_released & POINTER_BUTTON_PRIMARY != 0
+                    || event.buttons_down & POINTER_BUTTON_PRIMARY == 0
+                {
+                    drag = None;
+                }
+            }
+        }
+        self.resize_drag = drag;
+        if let Some((width, height)) = live_extent
+            && (width != self.frame.width() || height != self.frame.height())
+        {
+            self.frame
+                .resize(width, height)
+                .map_err(|_| GeometryProbeError::Ui4("live-resize"))?;
+        }
         Ok(())
     }
 
