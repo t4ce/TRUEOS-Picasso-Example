@@ -7,9 +7,6 @@ publish = false
 [package.metadata.trueos-blueprint]
 replicatable = true
 
-[lib]
-path = "src/lib.rs"
-
 [[bin]]
 name = "trueos-picasso-example"
 path = "src/main.rs"
@@ -22,4 +19,5 @@ trueos = { path = "../TRUEOS-Blueprints/api" }
 trueos-picasso = { path = "../TRUEOS-Picasso", default-features = false, features = ["blueprint"] }
 
 [build-dependencies]
+base64 = "0.22"
 gltf = { version = "1.4.1", default-features = false, features = ["utils"] }

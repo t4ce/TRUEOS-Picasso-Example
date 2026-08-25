@@ -1,139 +1,148 @@
-use std::{env, fs, path::PathBuf};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
+const ASSETS: [(&str, &str); 5] = [
+    ("DamagedHelmet", "Assets/DamagedHelmet/DamagedHelmet.glb"),
+    ("Triangle", "Assets/Triangle/Triangle.gltf"),
+    ("BoxInterleaved", "Assets/BoxInterleaved/BoxInterleaved.glb"),
+    (
+        "SimpleSparseAccessor",
+        "Assets/SimpleSparseAccessor/SimpleSparseAccessor.gltf",
+    ),
+    ("RiggedSimple", "Assets/RiggedSimple/RiggedSimple.glb"),
+];
 
 fn main() {
-    const SOURCE: &str = "Assets/DamagedHelmet/DamagedHelmet.glb";
-    println!("cargo:rerun-if-changed={SOURCE}");
-
-    let gltf = gltf::Gltf::open(SOURCE).expect("open DamagedHelmet GLB");
-    let blob = gltf.blob.as_deref();
-    let mesh = gltf
-        .meshes()
-        .next()
-        .expect("DamagedHelmet must contain a mesh");
-    let mut positions = Vec::<[f32; 3]>::new();
-    let mut normals = Vec::<[f32; 3]>::new();
-    let mut indices = Vec::<u32>::new();
-
-    for primitive in mesh.primitives() {
-        assert_eq!(
-            primitive.mode(),
-            gltf::mesh::Mode::Triangles,
-            "the prepared probe supports triangle-list primitives"
-        );
-        let reader = primitive.reader(|buffer| match buffer.source() {
-            gltf::buffer::Source::Bin => blob,
-            gltf::buffer::Source::Uri(_) => None,
-        });
-        let base = u32::try_from(positions.len()).expect("vertex count fits u32");
-        let primitive_positions = reader
-            .read_positions()
-            .expect("DamagedHelmet primitive must contain POSITION")
-            .collect::<Vec<_>>();
-        let primitive_normals = reader
-            .read_normals()
-            .expect("DamagedHelmet primitive must contain NORMAL")
-            .collect::<Vec<_>>();
-        assert_eq!(
-            primitive_normals.len(),
-            primitive_positions.len(),
-            "POSITION/NORMAL accessor counts must match"
-        );
-        let primitive_indices = reader
-            .read_indices()
-            .map(|values| values.into_u32().collect::<Vec<_>>())
-            .unwrap_or_else(|| {
-                (0..u32::try_from(primitive_positions.len()).expect("vertex count fits u32"))
-                    .collect()
-            });
-        positions.extend(primitive_positions);
-        normals.extend(primitive_normals);
-        indices.extend(
-            primitive_indices
-                .into_iter()
-                .map(|index| index.checked_add(base).expect("combined index fits u32")),
-        );
-    }
-
-    assert!(!positions.is_empty(), "DamagedHelmet mesh has no vertices");
-    assert_eq!(
-        normals.len(),
-        positions.len(),
-        "every position has one normal"
-    );
-    assert!(!indices.is_empty(), "DamagedHelmet mesh has no indices");
-    assert_eq!(indices.len() % 3, 0, "indices must form triangles");
-    normalize_to_clip_space(&mut positions);
-
-    let mut vertex_bytes = Vec::with_capacity(positions.len() * 12);
-    for position in &positions {
-        for component in position {
-            vertex_bytes.extend_from_slice(&component.to_le_bytes());
-        }
-    }
-    let mut posnormal_bytes = Vec::with_capacity(positions.len() * 24);
-    for (position, normal) in positions.iter().zip(&normals) {
-        assert!(
-            normal.iter().all(|component| component.is_finite()),
-            "mesh normals must be finite"
-        );
-        for component in position.iter().chain(normal) {
-            posnormal_bytes.extend_from_slice(&component.to_le_bytes());
-        }
-    }
-    let mut index_bytes = Vec::with_capacity(indices.len() * 4);
-    for index in &indices {
-        index_bytes.extend_from_slice(&index.to_le_bytes());
-    }
-
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set"));
-    fs::write(out.join("damaged_helmet.positions.f32le"), &vertex_bytes)
-        .expect("write prepared positions");
-    fs::write(out.join("damaged_helmet.posnormal.f32le"), &posnormal_bytes)
-        .expect("write prepared position/normal vertices");
-    fs::write(out.join("damaged_helmet.indices.u32le"), &index_bytes)
-        .expect("write prepared indices");
-    fs::write(
-        out.join("damaged_helmet.meta.rs"),
-        format!(
-            "pub const HELMET_VERTEX_COUNT: u32 = {};\n\
-             pub const HELMET_INDEX_COUNT: u32 = {};\n\
-             pub const HELMET_VERTEX_BYTES: u64 = {};\n\
-             pub const HELMET_POSNORMAL_BYTES: u64 = {};\n\
-             pub const HELMET_INDEX_BYTES: u64 = {};\n",
-            positions.len(),
-            indices.len(),
-            vertex_bytes.len(),
-            posnormal_bytes.len(),
-            index_bytes.len(),
-        ),
-    )
-    .expect("write prepared mesh metadata");
+    let mut catalog = String::from(
+        "pub const ASSET_COUNT: usize = 5;\npub static ASSETS: [PreparedAsset; ASSET_COUNT] = [\n",
+    );
+    for (slot, (name, source)) in ASSETS.iter().enumerate() {
+        println!("cargo:rerun-if-changed={source}");
+        let source_path = Path::new(source);
+        let (vertices, indices) = prepare(source_path);
+        let stem = name.to_ascii_lowercase();
+        let vertex_file = format!("{stem}.posnormal.f32le");
+        let index_file = format!("{stem}.indices.u32le");
+        fs::write(out.join(&vertex_file), &vertices).expect("write vertices");
+        fs::write(out.join(&index_file), &indices).expect("write indices");
+        catalog.push_str(&format!("PreparedAsset {{ name: \"{name}\", revision: 0, vertices: include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{vertex_file}\")), indices: include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{index_file}\")), vertex_count: {}, index_count: {}, helmet_program: {} }},\n", vertices.len()/24, indices.len()/4, slot==0));
+    }
+    catalog.push_str("];\n");
+    fs::write(out.join("prepared_assets.rs"), catalog).expect("write asset catalog");
 }
 
-fn normalize_to_clip_space(positions: &mut [[f32; 3]]) {
-    let mut min = [f32::INFINITY; 3];
-    let mut max = [f32::NEG_INFINITY; 3];
-    for position in positions.iter() {
-        assert!(
-            position.iter().all(|component| component.is_finite()),
-            "mesh positions must be finite"
-        );
-        for axis in 0..3 {
-            min[axis] = min[axis].min(position[axis]);
-            max[axis] = max[axis].max(position[axis]);
+fn prepare(source: &Path) -> (Vec<u8>, Vec<u8>) {
+    let bytes = fs::read(source).expect("read asset");
+    let parsed = gltf::Gltf::from_slice(&bytes).expect("parse asset");
+    let base = source.parent().unwrap_or(Path::new("."));
+    let buffers: Vec<Vec<u8>> = parsed
+        .buffers()
+        .map(|b| match b.source() {
+            gltf::buffer::Source::Bin => parsed.blob.clone().expect("BIN chunk"),
+            gltf::buffer::Source::Uri(uri) if uri.starts_with("data:") => base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                uri.split_once(',').expect("data URI").1,
+            )
+            .expect("base64 buffer"),
+            gltf::buffer::Source::Uri(uri) => fs::read(base.join(uri)).expect("external buffer"),
+        })
+        .collect();
+    let (mut positions, mut normals, mut indices) = (
+        Vec::<[f32; 3]>::new(),
+        Vec::<[f32; 3]>::new(),
+        Vec::<u32>::new(),
+    );
+    for mesh in parsed.meshes() {
+        for primitive in mesh.primitives() {
+            assert_eq!(
+                primitive.mode(),
+                gltf::mesh::Mode::Triangles,
+                "only triangle assets are supported"
+            );
+            let reader = primitive.reader(|b| Some(buffers[b.index()].as_slice()));
+            let base_vertex = positions.len() as u32;
+            let p: Vec<_> = reader.read_positions().expect("POSITION").collect();
+            let local: Vec<u32> = reader
+                .read_indices()
+                .map(|v| v.into_u32().collect())
+                .unwrap_or_else(|| (0..p.len() as u32).collect());
+            let n: Vec<_> = reader
+                .read_normals()
+                .map(|v| v.collect())
+                .unwrap_or_else(|| generated_normals(&p, &local));
+            assert_eq!(p.len(), n.len());
+            positions.extend(p);
+            normals.extend(n);
+            indices.extend(local.into_iter().map(|i| i + base_vertex));
         }
     }
-    let center = [
+    assert!(!positions.is_empty() && !indices.is_empty());
+    normalize(&mut positions);
+    let mut vb = Vec::with_capacity(positions.len() * 24);
+    for (p, n) in positions.iter().zip(normals) {
+        for v in p.iter().chain(n.iter()) {
+            vb.extend(v.to_le_bytes());
+        }
+    }
+    let mut ib = Vec::with_capacity(indices.len() * 4);
+    for i in indices {
+        ib.extend(i.to_le_bytes());
+    }
+    (vb, ib)
+}
+
+fn generated_normals(p: &[[f32; 3]], indices: &[u32]) -> Vec<[f32; 3]> {
+    let mut out = vec![[0.0; 3]; p.len()];
+    for tri in indices.chunks_exact(3) {
+        let a = p[tri[0] as usize];
+        let b = p[tri[1] as usize];
+        let c = p[tri[2] as usize];
+        let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+        let n = [
+            u[1] * v[2] - u[2] * v[1],
+            u[2] * v[0] - u[0] * v[2],
+            u[0] * v[1] - u[1] * v[0],
+        ];
+        for &i in tri {
+            for a in 0..3 {
+                out[i as usize][a] += n[a];
+            }
+        }
+    }
+    for n in &mut out {
+        let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+        if l > 0.0 {
+            for v in n {
+                *v /= l;
+            }
+        } else {
+            n[2] = 1.0;
+        }
+    }
+    out
+}
+fn normalize(p: &mut [[f32; 3]]) {
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+    for v in p.iter() {
+        for a in 0..3 {
+            min[a] = min[a].min(v[a]);
+            max[a] = max[a].max(v[a]);
+        }
+    }
+    let c = [
         (min[0] + max[0]) * 0.5,
         (min[1] + max[1]) * 0.5,
         (min[2] + max[2]) * 0.5,
     ];
-    let extent = (max[0] - min[0]).max(max[1] - min[1]).max(max[2] - min[2]);
-    assert!(extent > 0.0, "mesh must have a non-zero extent");
-    let scale = 1.6 / extent;
-    for position in positions {
-        for axis in 0..3 {
-            position[axis] = (position[axis] - center[axis]) * scale;
+    let e = (max[0] - min[0]).max(max[1] - min[1]).max(max[2] - min[2]);
+    assert!(e > 0.0);
+    for v in p {
+        for a in 0..3 {
+            v[a] = (v[a] - c[a]) * 1.6 / e;
         }
     }
 }
