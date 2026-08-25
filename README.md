@@ -53,6 +53,14 @@ package and submission contract land, the runtime presentation remains one
 head plus the three topology-proof lines rather than fabricating four
 CPU-transformed vertex copies.
 
+The probe uses Picasso's Blueprint-enabled `FlyCam`: WASD moves at 0.75 world
+units per second and holding the primary mouse button while moving the mouse
+rotates the view with normalized quaternion composition. The inverse camera
+pose is applied to the retained helmet transforms each frame. The static RGB
+lines remain a fixed frame reference under the current retained-submit ABI.
+Dragging the window's bottom-right resize grip suppresses camera rotation while
+still draining its routed mouse samples.
+
 There is no `std::fs`, glTF parser, redb backend, MASS filesystem adapter, or
 CLI in this build. Those are host-only Picasso features used before boot or by
 tools.

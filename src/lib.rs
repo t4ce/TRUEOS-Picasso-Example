@@ -11,11 +11,17 @@ use trueos::ui4_scene::{
 #[cfg(target_os = "trueos")]
 use trueos::vgpu::{
     BUFFER_USAGE_INDEX, BUFFER_USAGE_MAP_WRITE, BUFFER_USAGE_VERTEX, Buffer, BufferSlice,
-    Capabilities, Device, IndexedBatchDrawV2, Queue, QueueClass, RetainedFrameSubmit,
-    RetainedMesh, RetainedMeshDescriptor, RetainedTransformSeed, VVideoMem,
+    Capabilities, Device, IndexedBatchDrawV2, Queue, QueueClass, RetainedFrameSubmit, RetainedMesh,
+    RetainedMeshDescriptor, RetainedTransformSeed, VVideoMem,
 };
 #[cfg(any(test, target_os = "trueos"))]
 use trueos_picasso::ExecRing;
+#[cfg(any(test, target_os = "trueos"))]
+use trueos_picasso::GRID_INDICES;
+#[cfg(target_os = "trueos")]
+use trueos_picasso::GRID_VERTICES;
+#[cfg(target_os = "trueos")]
+use trueos_picasso::cam::{Camera, FlyCam, Projection, Quaternion};
 #[cfg(target_os = "trueos")]
 use trueos_picasso::{CubismError, SharedByteRange, VisibilityOps};
 use trueos_picasso::{
@@ -50,19 +56,6 @@ pub static HELMET_POSNORMAL: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/damaged_helmet.posnormal.f32le"));
 pub static HELMET_INDICES_U32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/damaged_helmet.indices.u32le"));
-
-/// Three independent native line-list primitives. They intentionally have no
-/// transform references: the mixed batch proves topology and transform scope
-/// are per draw rather than accidental global state.
-pub static RGB_LINE_VERTICES: [[f32; 3]; 6] = [
-    [0.0, 0.0, 0.0],
-    [1.20, 0.0, 0.0],
-    [0.0, 0.0, 0.0],
-    [0.0, 1.20, 0.0],
-    [0.0, 0.0, 0.0],
-    [-0.848_528, -0.848_528, 0.0],
-];
-pub static RGB_LINE_INDICES: [u32; 6] = [0, 1, 0, 1, 0, 1];
 
 #[cfg(any(test, target_os = "trueos"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -218,8 +211,10 @@ pub struct GeometryProbe {
     line_vertex_buffer: Buffer,
     line_index_buffer: Buffer,
     retained_mesh: RetainedMesh,
+    flycam: FlyCam,
     resize_drag: Option<ResizeDrag>,
     timeline: u64,
+    previous_elapsed_millis: u64,
 }
 
 #[cfg(target_os = "trueos")]
@@ -271,13 +266,13 @@ impl GeometryProbe {
             .map_err(|code| GeometryProbeError::Vgpu("helmet-index-buffer-create", code))?;
         let line_vertex_buffer = device
             .create_buffer(
-                core::mem::size_of_val(&RGB_LINE_VERTICES),
+                core::mem::size_of_val(&GRID_VERTICES),
                 BUFFER_USAGE_MAP_WRITE | BUFFER_USAGE_VERTEX,
             )
             .map_err(|code| GeometryProbeError::Vgpu("line-vertex-buffer-create", code))?;
         let line_index_buffer = device
             .create_buffer(
-                core::mem::size_of_val(&RGB_LINE_INDICES),
+                core::mem::size_of_val(&GRID_INDICES),
                 BUFFER_USAGE_MAP_WRITE | BUFFER_USAGE_INDEX,
             )
             .map_err(|code| GeometryProbeError::Vgpu("line-index-buffer-create", code))?;
@@ -287,9 +282,9 @@ impl GeometryProbe {
         write_exact(device, helmet_index_buffer, 0, HELMET_INDICES_U32)
             .map_err(|code| GeometryProbeError::Vgpu("helmet-index-upload", code))?;
         write_exact(device, line_vertex_buffer, 0, line_vertex_bytes())
-        .map_err(|code| GeometryProbeError::Vgpu("line-vertex-upload", code))?;
+            .map_err(|code| GeometryProbeError::Vgpu("line-vertex-upload", code))?;
         write_exact(device, line_index_buffer, 0, line_index_bytes())
-        .map_err(|code| GeometryProbeError::Vgpu("line-index-upload", code))?;
+            .map_err(|code| GeometryProbeError::Vgpu("line-index-upload", code))?;
 
         let retained_mesh = device
             .create_retained_mesh(
@@ -312,8 +307,22 @@ impl GeometryProbe {
             line_vertex_buffer,
             line_index_buffer,
             retained_mesh,
+            flycam: FlyCam::new(
+                Camera {
+                    position: [0.0; 3],
+                    rotation: Quaternion::IDENTITY,
+                    projection: Projection::Perspective {
+                        yfov: core::f32::consts::FRAC_PI_3,
+                        znear: 0.01,
+                        zfar: Some(100.0),
+                        aspect_ratio: None,
+                    },
+                },
+                0.75,
+            ),
             resize_drag: None,
             timeline: 0,
+            previous_elapsed_millis: 0,
         };
         probe.render_frame(0)?;
         Ok(probe)
@@ -323,6 +332,16 @@ impl GeometryProbe {
     /// Geometry remains resident; only these seeds and the UI4 lease vary.
     pub fn render_frame(&mut self, elapsed_millis: u64) -> Result<(), GeometryProbeError> {
         self.service_frame_interaction()?;
+        let delta_seconds =
+            elapsed_millis.saturating_sub(self.previous_elapsed_millis) as f32 * 0.001;
+        self.previous_elapsed_millis = elapsed_millis;
+        let rotation_before_input = self.flycam.camera.rotation;
+        self.flycam.step_blueprint(delta_seconds);
+        // The frame's bottom-right primary-button drag owns pointer motion.
+        // Input is still drained, but resizing must not also rotate the view.
+        if self.resize_drag.is_some() {
+            self.flycam.camera.rotation = rotation_before_input;
+        }
         let width = self.frame.width();
         let height = self.frame.height();
 
@@ -345,7 +364,7 @@ impl GeometryProbe {
                     clear_rgba8_srgb: u32::from_le_bytes([15, 20, 38, 255]),
                     seed_count: HEAD_INSTANCE_COUNT,
                     static_draw_count: 3,
-                    seeds: retained_seeds(elapsed_millis),
+                    seeds: retained_seeds(elapsed_millis, self.flycam.camera),
                     static_draws: retained_line_draws(),
                     ..RetainedFrameSubmit::default()
                 },
@@ -422,10 +441,14 @@ impl GeometryProbe {
             if let Some(active) = drag
                 && active.source == event.source
             {
-                let width = (i64::from(active.width) + i64::from(event.x) - i64::from(active.anchor_x))
-                    .clamp(i64::from(MIN_WIDTH), i64::from(output_width)) as u32;
-                let height = (i64::from(active.height) + i64::from(event.y) - i64::from(active.anchor_y))
-                    .clamp(i64::from(MIN_HEIGHT), i64::from(output_height)) as u32;
+                let width = (i64::from(active.width) + i64::from(event.x)
+                    - i64::from(active.anchor_x))
+                .clamp(i64::from(MIN_WIDTH), i64::from(output_width))
+                    as u32;
+                let height = (i64::from(active.height) + i64::from(event.y)
+                    - i64::from(active.anchor_y))
+                .clamp(i64::from(MIN_HEIGHT), i64::from(output_height))
+                    as u32;
                 live_extent = Some((width, height));
                 if event.buttons_released & POINTER_BUTTON_PRIMARY != 0
                     || event.buttons_down & POINTER_BUTTON_PRIMARY == 0
@@ -473,6 +496,7 @@ fn retained_line_draws() -> [IndexedBatchDrawV2; trueos::vgpu::MAX_RETAINED_STAT
 #[cfg(target_os = "trueos")]
 fn retained_seeds(
     elapsed_millis: u64,
+    camera: Camera,
 ) -> [RetainedTransformSeed; trueos::vgpu::MAX_RETAINED_TRANSFORM_SEEDS] {
     let seconds = elapsed_millis as f32 * 0.001;
     let half_angle = core::f32::consts::FRAC_PI_4 * seconds;
@@ -486,22 +510,33 @@ fn retained_seeds(
         [-0.5, -0.5, 0.0],
         [0.5, -0.5, 0.0],
     ];
-    core::array::from_fn(|slot| RetainedTransformSeed {
-        translation: translations[slot],
-        scale: if slot == 2 {
-            [0.45 * pulse; 3]
-        } else {
-            [0.45; 3]
-        },
-        rotation: match slot {
+    let [qx, qy, qz, qw] = camera.rotation.normalized().0;
+    let view_rotation = Quaternion([-qx, -qy, -qz, qw]);
+    core::array::from_fn(|slot| {
+        let world_translation = translations[slot];
+        let view_translation = view_rotation.rotate([
+            world_translation[0] - camera.position[0],
+            world_translation[1] - camera.position[1],
+            world_translation[2] - camera.position[2],
+        ]);
+        let world_rotation = match slot {
             0 => clockwise,
             1 => counter_clockwise,
             _ => [0.0, 0.0, 0.0, 1.0],
-        },
-        local_radius: 1.0,
-        previous_translation: translations[slot],
-        draw_group: 0,
-        flags: (slot as u32) << 16,
+        };
+        RetainedTransformSeed {
+            translation: view_translation,
+            scale: if slot == 2 {
+                [0.45 * pulse; 3]
+            } else {
+                [0.45; 3]
+            },
+            rotation: (view_rotation * Quaternion(world_rotation)).normalized().0,
+            local_radius: 1.0,
+            previous_translation: view_translation,
+            draw_group: 0,
+            flags: (slot as u32) << 16,
+        }
     })
 }
 
@@ -509,8 +544,8 @@ fn retained_seeds(
 fn line_vertex_bytes() -> &'static [u8] {
     unsafe {
         core::slice::from_raw_parts(
-            RGB_LINE_VERTICES.as_ptr().cast::<u8>(),
-            core::mem::size_of_val(&RGB_LINE_VERTICES),
+            GRID_VERTICES.as_ptr().cast::<u8>(),
+            core::mem::size_of_val(&GRID_VERTICES),
         )
     }
 }
@@ -519,8 +554,8 @@ fn line_vertex_bytes() -> &'static [u8] {
 fn line_index_bytes() -> &'static [u8] {
     unsafe {
         core::slice::from_raw_parts(
-            RGB_LINE_INDICES.as_ptr().cast::<u8>(),
-            core::mem::size_of_val(&RGB_LINE_INDICES),
+            GRID_INDICES.as_ptr().cast::<u8>(),
+            core::mem::size_of_val(&GRID_INDICES),
         )
     }
 }
@@ -760,6 +795,6 @@ mod tests {
             );
             assert_eq!(draw.rgba8_srgb, u32::from_le_bytes(expected_rgba));
         }
-        assert_eq!(RGB_LINE_INDICES, [0, 1, 0, 1, 0, 1]);
+        assert_eq!(GRID_INDICES, [0, 1, 0, 1, 0, 1]);
     }
 }

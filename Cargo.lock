@@ -282,6 +282,10 @@ dependencies = [
 [[package]]
 name = "trueos-picasso"
 version = "0.1.0"
+dependencies = [
+ "libm",
+ "trueos",
+]
 
 [[package]]
 name = "trueos-picasso-example"

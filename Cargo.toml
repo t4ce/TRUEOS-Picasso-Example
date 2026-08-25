@@ -22,7 +22,7 @@ bench = false
 [dependencies]
 libm = "0.2"
 trueos = { path = "../TRUEOS-Blueprints/api" }
-trueos-picasso = { path = "../TRUEOS-Picasso", default-features = false }
+trueos-picasso = { path = "../TRUEOS-Picasso", default-features = false, features = ["blueprint"] }
 
 [build-dependencies]
 gltf = { version = "1.4.1", default-features = false, features = ["utils"] }
