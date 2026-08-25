@@ -55,7 +55,11 @@ fn main() {
     }
 
     assert!(!positions.is_empty(), "DamagedHelmet mesh has no vertices");
-    assert_eq!(normals.len(), positions.len(), "every position has one normal");
+    assert_eq!(
+        normals.len(),
+        positions.len(),
+        "every position has one normal"
+    );
     assert!(!indices.is_empty(), "DamagedHelmet mesh has no indices");
     assert_eq!(indices.len() % 3, 0, "indices must form triangles");
     normalize_to_clip_space(&mut positions);
@@ -84,11 +88,8 @@ fn main() {
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set"));
     fs::write(out.join("damaged_helmet.positions.f32le"), &vertex_bytes)
         .expect("write prepared positions");
-    fs::write(
-        out.join("damaged_helmet.posnormal.f32le"),
-        &posnormal_bytes,
-    )
-    .expect("write prepared position/normal vertices");
+    fs::write(out.join("damaged_helmet.posnormal.f32le"), &posnormal_bytes)
+        .expect("write prepared position/normal vertices");
     fs::write(out.join("damaged_helmet.indices.u32le"), &index_bytes)
         .expect("write prepared indices");
     fs::write(

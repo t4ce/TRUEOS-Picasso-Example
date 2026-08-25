@@ -4,25 +4,18 @@
 //! receives only stable resource identities and byte-relative ranges.
 #![no_std]
 
-#[cfg(target_os = "trueos")]
 use trueos::ui4_scene::{
     CursorIcon, CursorSource, Damage, Frame, POINTER_BUTTON_PRIMARY, output_dimensions,
 };
-#[cfg(target_os = "trueos")]
 use trueos::vgpu::{
     BUFFER_USAGE_INDEX, BUFFER_USAGE_MAP_WRITE, BUFFER_USAGE_VERTEX, Buffer, BufferSlice,
     Capabilities, Device, IndexedBatchDrawV2, Queue, QueueClass, RetainedFrameSubmit, RetainedMesh,
     RetainedMeshDescriptor, RetainedTransformSeed, VVideoMem,
 };
-#[cfg(any(test, target_os = "trueos"))]
 use trueos_picasso::ExecRing;
-#[cfg(any(test, target_os = "trueos"))]
 use trueos_picasso::GRID_INDICES;
-#[cfg(target_os = "trueos")]
 use trueos_picasso::GRID_VERTICES;
-#[cfg(target_os = "trueos")]
 use trueos_picasso::cam::{Camera, FlyCam, Projection, Quaternion};
-#[cfg(target_os = "trueos")]
 use trueos_picasso::{CubismError, SharedByteRange, VisibilityOps};
 use trueos_picasso::{
     ExecutablePrimitive, PreparedRange, PrimitiveTopology, ResourceId, SharedResourceId,
@@ -57,7 +50,6 @@ pub static HELMET_POSNORMAL: &[u8] =
 pub static HELMET_INDICES_U32: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/damaged_helmet.indices.u32le"));
 
-#[cfg(any(test, target_os = "trueos"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MixedTopologyDraw {
     index_count: u32,
@@ -67,7 +59,6 @@ struct MixedTopologyDraw {
     topology: PrimitiveTopology,
 }
 
-#[cfg(any(test, target_os = "trueos"))]
 fn mixed_topology_plan(
     helmet_index_count: u32,
     helmet_vertex_count: u32,
@@ -201,7 +192,6 @@ pub const fn head_transform_refs(
 ///
 /// Picasso contributes only logical resource ranges. This TRUEOS adapter maps
 /// those ranges to opaque vGPU buffers; no GPU virtual address crosses it.
-#[cfg(target_os = "trueos")]
 pub struct GeometryProbe {
     frame: Frame,
     device: Device,
@@ -217,7 +207,6 @@ pub struct GeometryProbe {
     previous_elapsed_millis: u64,
 }
 
-#[cfg(target_os = "trueos")]
 #[derive(Clone, Copy)]
 struct ResizeDrag {
     source: CursorSource,
@@ -227,7 +216,6 @@ struct ResizeDrag {
     height: u32,
 }
 
-#[cfg(target_os = "trueos")]
 impl GeometryProbe {
     pub fn open() -> Result<Self, GeometryProbeError> {
         const WIDTH: u32 = 640;
@@ -331,17 +319,13 @@ impl GeometryProbe {
     /// Advance the compact transform state and render one complete frame.
     /// Geometry remains resident; only these seeds and the UI4 lease vary.
     pub fn render_frame(&mut self, elapsed_millis: u64) -> Result<(), GeometryProbeError> {
-        self.service_frame_interaction()?;
         let delta_seconds =
             elapsed_millis.saturating_sub(self.previous_elapsed_millis) as f32 * 0.001;
         self.previous_elapsed_millis = elapsed_millis;
-        let rotation_before_input = self.flycam.camera.rotation;
-        self.flycam.step_blueprint(delta_seconds);
-        // The frame's bottom-right primary-button drag owns pointer motion.
-        // Input is still drained, but resizing must not also rotate the view.
-        if self.resize_drag.is_some() {
-            self.flycam.camera.rotation = rotation_before_input;
-        }
+        self.flycam
+            .step_ui4(&self.frame, delta_seconds)
+            .map_err(|_| GeometryProbeError::Ui4("flycam-ui4"))?;
+        self.service_frame_interaction()?;
         let width = self.frame.width();
         let height = self.frame.height();
 
@@ -418,6 +402,11 @@ impl GeometryProbe {
                 && event.local_x < self.frame.width() as i32
                 && event.local_y < self.frame.height() as i32;
             let owns_drag = drag.is_some_and(|active| active.source == event.source);
+            // The app owns bottom-right resizing. Everything else remains
+            // available to Picasso through the same UI4-routed event; nothing
+            // is drained by the library behind the application's back.
+            self.flycam
+                .handle_ui4_pointer_event(&event, !in_grip && !owns_drag);
             self.frame
                 .set_cursor_icon_for(
                     event.source,
@@ -479,7 +468,6 @@ impl GeometryProbe {
     }
 }
 
-#[cfg(target_os = "trueos")]
 fn retained_line_draws() -> [IndexedBatchDrawV2; trueos::vgpu::MAX_RETAINED_STATIC_DRAWS] {
     core::array::from_fn(|slot| IndexedBatchDrawV2 {
         index_count: 2,
@@ -493,7 +481,6 @@ fn retained_line_draws() -> [IndexedBatchDrawV2; trueos::vgpu::MAX_RETAINED_STAT
     })
 }
 
-#[cfg(target_os = "trueos")]
 fn retained_seeds(
     elapsed_millis: u64,
     camera: Camera,
@@ -540,7 +527,6 @@ fn retained_seeds(
     })
 }
 
-#[cfg(target_os = "trueos")]
 fn line_vertex_bytes() -> &'static [u8] {
     unsafe {
         core::slice::from_raw_parts(
@@ -550,7 +536,6 @@ fn line_vertex_bytes() -> &'static [u8] {
     }
 }
 
-#[cfg(target_os = "trueos")]
 fn line_index_bytes() -> &'static [u8] {
     unsafe {
         core::slice::from_raw_parts(
@@ -560,7 +545,6 @@ fn line_index_bytes() -> &'static [u8] {
     }
 }
 
-#[cfg(target_os = "trueos")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GeometryProbeError {
     Contract,
@@ -568,7 +552,6 @@ pub enum GeometryProbeError {
     Vgpu(&'static str, i32),
 }
 
-#[cfg(target_os = "trueos")]
 fn write_exact(device: Device, buffer: Buffer, offset: u64, bytes: &[u8]) -> Result<(), i32> {
     let offset = usize::try_from(offset).map_err(|_| trueos::vgpu::ERR_UNSUPPORTED)?;
     let written = device.write_buffer(buffer, offset, bytes)?;
@@ -579,13 +562,11 @@ fn write_exact(device: Device, buffer: Buffer, offset: u64, bytes: &[u8]) -> Res
 
 /// TRUEOS-specific materialization adapter. Field order is intentional: the
 /// ring is dropped before `memory`, so `VVideoMem` backs every live ring view.
-#[cfg(target_os = "trueos")]
 pub struct VVideoRing {
     ring: ExecRing,
     memory: VVideoMem,
 }
 
-#[cfg(target_os = "trueos")]
 impl VVideoRing {
     /// Allocate and initialize a new page-pinned shared region.
     pub fn allocate_fresh(
@@ -638,7 +619,6 @@ impl VVideoRing {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg(target_os = "trueos")]
 pub enum VVideoRingError {
     Vgpu(i32),
     Cubism(CubismError),
@@ -649,13 +629,11 @@ pub enum VVideoRingError {
 /// flushes slot data first, then the published header control line. It
 /// invalidates just the GPU-owned payload after retirement has read the
 /// CPU-owned header metadata.
-#[cfg(target_os = "trueos")]
 pub struct VVideoVisibility<'a> {
     memory: &'a VVideoMem,
     resource: SharedResourceId,
 }
 
-#[cfg(target_os = "trueos")]
 impl VisibilityOps for VVideoVisibility<'_> {
     fn cpu_make_gpu_visible(&self, range: SharedByteRange) -> Result<(), CubismError> {
         self.maintain(range, true)
@@ -670,7 +648,6 @@ impl VisibilityOps for VVideoVisibility<'_> {
     }
 }
 
-#[cfg(target_os = "trueos")]
 impl VVideoVisibility<'_> {
     fn maintain(&self, range: SharedByteRange, flush: bool) -> Result<(), CubismError> {
         if range.resource != self.resource {

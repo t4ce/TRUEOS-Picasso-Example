@@ -55,11 +55,14 @@ CPU-transformed vertex copies.
 
 The probe uses Picasso's Blueprint-enabled `FlyCam`: WASD moves at 0.75 world
 units per second and holding the primary mouse button while moving the mouse
-rotates the view with normalized quaternion composition. The inverse camera
-pose is applied to the retained helmet transforms each frame. The static RGB
-lines remain a fixed frame reference under the current retained-submit ABI.
-Dragging the window's bottom-right resize grip suppresses camera rotation while
-still draining its routed mouse samples.
+rotates the view with normalized quaternion composition. Input is routed by
+UI4 first (focus, selected cursor/combo, and pointer capture); the example
+then supplies its already-drained pointer events to Picasso, so Picasso never
+reads raw HID rings or steals unrelated frame events. The inverse camera pose
+is applied to the retained helmet transforms each frame. The static RGB lines
+remain a fixed frame reference under the current retained-submit ABI. Dragging
+the window's bottom-right resize grip keeps ownership in the example and
+suppresses camera rotation for that gesture.
 
 There is no `std::fs`, glTF parser, redb backend, MASS filesystem adapter, or
 CLI in this build. Those are host-only Picasso features used before boot or by
