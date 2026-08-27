@@ -23,6 +23,7 @@ use trueos::{
 use trueos_picasso::ExecRing;
 use trueos_picasso::GRID_INDICES;
 use trueos_picasso::GRID_VERTICES;
+use trueos_picasso::Picasso;
 use trueos_picasso::cam::{Camera, FlyCam, Projection, Quaternion};
 use trueos_picasso::{CubismError, SharedByteRange, VVideoRingError, VisibilityOps};
 use trueos_picasso::{
@@ -32,7 +33,6 @@ use trueos_picasso::{
 
 pub struct PreparedAsset {
     pub name: &'static str,
-    pub revision: u64,
     pub vertices: &'static [u8],
     pub indices: &'static [u8],
     pub vertex_count: u32,
@@ -479,10 +479,9 @@ impl GeometryProbe {
                 logl::log(
                     level::INFO,
                     format_args!(
-                        "PicassoExample: asset hotkey={} selected={} revision={} vertices={} indices={} instances={}",
+                        "PicassoExample: asset hotkey={} selected={} vertices={} indices={} instances={}",
                         slot + 1,
                         ASSETS[slot].name,
-                        ASSETS[slot].revision,
                         ASSETS[slot].vertex_count,
                         ASSETS[slot].index_count,
                         if ASSETS[slot].helmet_program { 4 } else { 1 }
@@ -811,6 +810,42 @@ impl VVideoVisibility<'_> {
 }
 
 fn main() {
+    // The example owns only the immutable source bytes. Picasso owns their
+    // runtime representation behind this public asset-ingestion boundary.
+    let picasso = match Picasso::new() {
+        Ok(picasso) => picasso,
+        Err(error) => {
+            logl::log(
+                level::ERROR,
+                format_args!("PicassoExample: Picasso creation failed: {error:?}"),
+            );
+            return;
+        }
+    };
+    let mut source_bytes = 0usize;
+    for asset in &demodata::ASSETS {
+        if let Err(error) = picasso.put_embedded_asset(asset.name, asset.bytes) {
+            logl::log(
+                level::ERROR,
+                format_args!(
+                    "PicassoExample: embedded asset rejected asset={} bytes={} error={error:?}",
+                    asset.name,
+                    asset.bytes.len(),
+                ),
+            );
+            return;
+        }
+        source_bytes += asset.bytes.len();
+    }
+    logl::log(
+        level::INFO,
+        format_args!(
+            "PicassoExample: embedded assets accepted by Picasso assets={} exact_source_bytes={}",
+            demodata::ASSETS.len(),
+            source_bytes,
+        ),
+    );
+
     let mut probe = match GeometryProbe::open() {
         Ok(probe) => probe,
         Err(error) => {
@@ -822,20 +857,10 @@ fn main() {
         }
     };
 
-    demodata::import_into(|name, bytes| {
-        logl::log(
-            level::INFO,
-            format_args!(
-                "PicassoExample: demo source asset loaded: name={name} bytes={}",
-                bytes.len(),
-            ),
-        );
-    });
-
     logl::log(
         level::INFO,
         format_args!(
-            "PicassoExample: retained textured DamagedHelmet instances + static RGB lines submitted and retired: vertices={} indices={} texture_bound={} timeline={}",
+            "PicassoExample: prepared textured DamagedHelmet instances + static RGB lines submitted and retired: vertices={} indices={} texture_bound={} timeline={}",
             HELMET_VERTEX_COUNT,
             HELMET_INDEX_COUNT,
             probe.base_color_textures[0].is_some() as u8,

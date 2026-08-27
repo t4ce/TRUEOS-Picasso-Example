@@ -37,7 +37,7 @@ fn main() {
         } else {
             (String::new(), String::from("&[]"))
         };
-        catalog.push_str(&format!("PreparedAsset {{ name: \"{name}\", revision: 0, vertices: include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{vertex_file}\")), indices: include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{index_file}\")), vertex_count: {}, index_count: {}, vertex_stride: {vertex_stride}, base_color_name: \"{base_color_name}\", base_color_bytes: {base_color_bytes}, sampled_material: {}, helmet_program: {} }},\n", vertices.len()/vertex_stride, indices.len()/4, !base_color_name.is_empty(), slot==0));
+        catalog.push_str(&format!("PreparedAsset {{ name: \"{name}\", vertices: include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{vertex_file}\")), indices: include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{index_file}\")), vertex_count: {}, index_count: {}, vertex_stride: {vertex_stride}, base_color_name: \"{base_color_name}\", base_color_bytes: {base_color_bytes}, sampled_material: {}, helmet_program: {} }},\n", vertices.len()/vertex_stride, indices.len()/4, !base_color_name.is_empty(), slot==0));
     }
     catalog.push_str("];\n");
     fs::write(out.join("prepared_assets.rs"), catalog).expect("write asset catalog");

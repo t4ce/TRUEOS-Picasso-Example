@@ -21,3 +21,9 @@ trueos-picasso = { path = "../TRUEOS-Picasso", default-features = false, feature
 [build-dependencies]
 base64 = "0.22"
 gltf = { version = "1.4.1", default-features = false, features = ["utils"] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

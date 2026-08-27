@@ -1,18 +1,14 @@
-// Additional demo source assets owned by the example. The importer is supplied
-// by the caller so this module never opens or owns a database.
+//! Source assets owned and embedded by Picasso Example.
+//!
+//! These exact bytes are passed to Picasso's public embedded-asset API. This
+//! module deliberately knows nothing about Picasso's internal storage.
 
 pub struct DemoAsset {
     pub name: &'static str,
     pub bytes: &'static [u8],
 }
 
-pub fn import_into(mut importer: impl FnMut(&str, &[u8])) {
-    for asset in &ASSETS {
-        importer(asset.name, asset.bytes);
-    }
-}
-
-pub static ASSETS: [DemoAsset; 4] = [
+pub static ASSETS: [DemoAsset; 5] = [
     DemoAsset {
         name: "Triangle",
         bytes: include_bytes!(concat!(
@@ -39,6 +35,13 @@ pub static ASSETS: [DemoAsset; 4] = [
         bytes: include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/Assets/RiggedSimple/RiggedSimple.glb"
+        )),
+    },
+    DemoAsset {
+        name: "DamagedHelmet",
+        bytes: include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/Assets/DamagedHelmet/DamagedHelmet.glb"
         )),
     },
 ];
