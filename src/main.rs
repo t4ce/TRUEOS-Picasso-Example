@@ -11,7 +11,8 @@ use trueos::ui4_scene::{
 };
 use trueos::vgpu::{
     BUFFER_USAGE_INDEX, BUFFER_USAGE_MAP_WRITE, BUFFER_USAGE_VERTEX, Buffer, BufferSlice,
-    Capabilities, Device, IndexedBatchDrawV2, Queue, QueueClass, RetainedFrameSubmit, RetainedMesh,
+    Capabilities, Device, IndexedBatchDrawV2, Queue, QueueClass, RETAINED_VERTEX_LAYOUT_POS_NORMAL,
+    RETAINED_VERTEX_LAYOUT_POS_NORMAL_UV, RetainedFrameSubmit, RetainedMesh,
     RetainedMeshDescriptor, RetainedTransformSeed, VVideoMem,
 };
 use trueos::{
@@ -36,6 +37,10 @@ pub struct PreparedAsset {
     pub indices: &'static [u8],
     pub vertex_count: u32,
     pub index_count: u32,
+    pub vertex_stride: usize,
+    pub base_color_name: &'static str,
+    pub base_color_bytes: &'static [u8],
+    pub sampled_material: bool,
     pub helmet_program: bool,
 }
 include!(concat!(env!("OUT_DIR"), "/prepared_assets.rs"));
@@ -214,6 +219,7 @@ pub struct GeometryProbe {
     _asset_index_buffers: [Option<Buffer>; ASSET_COUNT],
     line_vertex_buffer: Buffer,
     line_index_buffer: Buffer,
+    base_color_textures: [Option<trueos::vmedia::RetainedTexture>; ASSET_COUNT],
     retained_meshes: [Option<RetainedMesh>; ASSET_COUNT],
     selected_asset: usize,
     number_keys: u8,
@@ -284,6 +290,11 @@ impl GeometryProbe {
                     RetainedMeshDescriptor {
                         vertex_count: asset.vertex_count,
                         index_count: asset.index_count,
+                        vertex_layout: if asset.sampled_material {
+                            RETAINED_VERTEX_LAYOUT_POS_NORMAL_UV
+                        } else {
+                            RETAINED_VERTEX_LAYOUT_POS_NORMAL
+                        },
                         ..RetainedMeshDescriptor::default()
                     },
                 )
@@ -318,6 +329,7 @@ impl GeometryProbe {
             _asset_index_buffers: asset_index_buffers,
             line_vertex_buffer,
             line_index_buffer,
+            base_color_textures: core::array::from_fn(|_| None),
             retained_meshes,
             selected_asset: 0,
             number_keys: 0,
@@ -338,6 +350,47 @@ impl GeometryProbe {
             timeline: 0,
             previous_elapsed_millis: 0,
         };
+        for (slot, asset) in ASSETS.iter().enumerate() {
+            if asset.base_color_bytes.is_empty() {
+                continue;
+            }
+            let texture = trueos::async_fs::block_on(trueos::vmedia::decode_retained_asset(
+                probe.device,
+                asset.base_color_name,
+                asset.base_color_bytes,
+            ));
+            match texture {
+                Ok(texture) => {
+                    let info = texture.info();
+                    logl::log(
+                        level::INFO,
+                        format_args!(
+                            "PicassoExample: texture proof accepted=1 asset={} role=base-color encoded_bytes={} texture_id=0x{:X} decoded={}x{} stride={} residency={:?} kernel_rgba_readback=0",
+                            asset.name,
+                            asset.base_color_bytes.len(),
+                            info.id.raw(),
+                            info.width,
+                            info.height,
+                            info.stride_bytes,
+                            info.residency,
+                        ),
+                    );
+                    probe.base_color_textures[slot] = Some(texture);
+                }
+                Err(code) => {
+                    logl::log(
+                        level::ERROR,
+                        format_args!(
+                            "PicassoExample: texture proof accepted=0 asset={} role=base-color encoded_bytes={} error={} action=abort-textured-scene-contract",
+                            asset.name,
+                            asset.base_color_bytes.len(),
+                            code,
+                        ),
+                    );
+                    return Err(GeometryProbeError::Vgpu("base-color-texture-decode", code));
+                }
+            }
+        }
         probe.render_frame(0)?;
         Ok(probe)
     }
@@ -372,7 +425,15 @@ impl GeometryProbe {
                 self.line_vertex_buffer,
                 self.line_index_buffer,
                 RetainedFrameSubmit {
-                    clear_rgba8_srgb: u32::from_le_bytes([15, 20, 38, 255]),
+                    base_color_texture: if ASSETS[self.selected_asset].sampled_material {
+                        self.base_color_textures[self.selected_asset]
+                            .as_ref()
+                            .map(|texture| texture.id().raw())
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    },
+                    clear_rgba8_srgb: u32::from_le_bytes([0, 128, 0, 0]),
                     seed_count: retained_seed_count(ASSETS[self.selected_asset].helmet_program),
                     static_draw_count: 3,
                     seeds: retained_seeds(
@@ -774,9 +835,10 @@ fn main() {
     logl::log(
         level::INFO,
         format_args!(
-            "PicassoExample: retained DamagedHelmet instances + static RGB lines submitted and retired: vertices={} indices={} timeline={}",
+            "PicassoExample: retained textured DamagedHelmet instances + static RGB lines submitted and retired: vertices={} indices={} texture_bound={} timeline={}",
             HELMET_VERTEX_COUNT,
             HELMET_INDEX_COUNT,
+            probe.base_color_textures[0].is_some() as u8,
             probe.timeline(),
         ),
     );

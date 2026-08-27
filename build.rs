@@ -21,19 +21,29 @@ fn main() {
     for (slot, (name, source)) in ASSETS.iter().enumerate() {
         println!("cargo:rerun-if-changed={source}");
         let source_path = Path::new(source);
-        let (vertices, indices) = prepare(source_path);
+        let (vertices, indices, base_color, vertex_stride) = prepare(source_path);
         let stem = name.to_ascii_lowercase();
         let vertex_file = format!("{stem}.posnormal.f32le");
         let index_file = format!("{stem}.indices.u32le");
         fs::write(out.join(&vertex_file), &vertices).expect("write vertices");
         fs::write(out.join(&index_file), &indices).expect("write indices");
-        catalog.push_str(&format!("PreparedAsset {{ name: \"{name}\", revision: 0, vertices: include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{vertex_file}\")), indices: include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{index_file}\")), vertex_count: {}, index_count: {}, helmet_program: {} }},\n", vertices.len()/24, indices.len()/4, slot==0));
+        let (base_color_name, base_color_bytes) = if let Some((extension, bytes)) = base_color {
+            let file = format!("{stem}.basecolor.{extension}");
+            fs::write(out.join(&file), bytes).expect("write base-color texture");
+            (
+                format!("{name}.basecolor.{extension}"),
+                format!("include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{file}\"))"),
+            )
+        } else {
+            (String::new(), String::from("&[]"))
+        };
+        catalog.push_str(&format!("PreparedAsset {{ name: \"{name}\", revision: 0, vertices: include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{vertex_file}\")), indices: include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{index_file}\")), vertex_count: {}, index_count: {}, vertex_stride: {vertex_stride}, base_color_name: \"{base_color_name}\", base_color_bytes: {base_color_bytes}, sampled_material: {}, helmet_program: {} }},\n", vertices.len()/vertex_stride, indices.len()/4, !base_color_name.is_empty(), slot==0));
     }
     catalog.push_str("];\n");
     fs::write(out.join("prepared_assets.rs"), catalog).expect("write asset catalog");
 }
 
-fn prepare(source: &Path) -> (Vec<u8>, Vec<u8>) {
+fn prepare(source: &Path) -> (Vec<u8>, Vec<u8>, Option<(&'static str, Vec<u8>)>, usize) {
     let bytes = fs::read(source).expect("read asset");
     let parsed = gltf::Gltf::from_slice(&bytes).expect("parse asset");
     let base = source.parent().unwrap_or(Path::new("."));
@@ -49,9 +59,20 @@ fn prepare(source: &Path) -> (Vec<u8>, Vec<u8>) {
             gltf::buffer::Source::Uri(uri) => fs::read(base.join(uri)).expect("external buffer"),
         })
         .collect();
-    let (mut positions, mut normals, mut indices) = (
+    let base_color = parsed
+        .materials()
+        .find_map(|material| {
+            material
+                .pbr_metallic_roughness()
+                .base_color_texture()
+                .map(|info| info.texture().source().source())
+        })
+        .and_then(|image| load_supported_image(image, &buffers, base));
+    let sampled_material = base_color.is_some();
+    let (mut positions, mut normals, mut uvs, mut indices) = (
         Vec::<[f32; 3]>::new(),
         Vec::<[f32; 3]>::new(),
+        Vec::<[f32; 2]>::new(),
         Vec::<u32>::new(),
     );
     for mesh in parsed.meshes() {
@@ -72,25 +93,83 @@ fn prepare(source: &Path) -> (Vec<u8>, Vec<u8>) {
                 .read_normals()
                 .map(|v| v.collect())
                 .unwrap_or_else(|| generated_normals(&p, &local));
+            let uv: Vec<_> = reader
+                .read_tex_coords(0)
+                .map(|coords| coords.into_f32().collect())
+                .unwrap_or_else(|| vec![[0.0; 2]; p.len()]);
             assert_eq!(p.len(), n.len());
+            assert_eq!(p.len(), uv.len());
             positions.extend(p);
             normals.extend(n);
+            uvs.extend(uv);
             indices.extend(local.into_iter().map(|i| i + base_vertex));
         }
     }
     assert!(!positions.is_empty() && !indices.is_empty());
     normalize(&mut positions);
-    let mut vb = Vec::with_capacity(positions.len() * 24);
-    for (p, n) in positions.iter().zip(normals) {
+    let vertex_stride = if sampled_material { 32 } else { 24 };
+    let mut vb = Vec::with_capacity(positions.len() * vertex_stride);
+    for ((p, n), uv) in positions.iter().zip(normals).zip(uvs) {
         for v in p.iter().chain(n.iter()) {
             vb.extend(v.to_le_bytes());
+        }
+        if sampled_material {
+            for v in uv {
+                vb.extend(v.to_le_bytes());
+            }
         }
     }
     let mut ib = Vec::with_capacity(indices.len() * 4);
     for i in indices {
         ib.extend(i.to_le_bytes());
     }
-    (vb, ib)
+    (vb, ib, base_color, vertex_stride)
+}
+
+fn load_supported_image(
+    source: gltf::image::Source<'_>,
+    buffers: &[Vec<u8>],
+    base: &Path,
+) -> Option<(&'static str, Vec<u8>)> {
+    match source {
+        gltf::image::Source::View { view, mime_type } => {
+            let extension = supported_image_extension(mime_type)?;
+            let start = view.offset();
+            let end = start.checked_add(view.length())?;
+            Some((
+                extension,
+                buffers
+                    .get(view.buffer().index())?
+                    .get(start..end)?
+                    .to_vec(),
+            ))
+        }
+        gltf::image::Source::Uri { uri, mime_type } => {
+            let extension = mime_type.and_then(supported_image_extension).or_else(|| {
+                uri.rsplit_once('.')
+                    .and_then(|(_, ext)| supported_image_extension(ext))
+            })?;
+            let bytes = if uri.starts_with("data:") {
+                base64::Engine::decode(
+                    &base64::engine::general_purpose::STANDARD,
+                    uri.split_once(',')?.1,
+                )
+                .ok()?
+            } else {
+                fs::read(base.join(uri)).ok()?
+            };
+            Some((extension, bytes))
+        }
+    }
+}
+
+fn supported_image_extension(value: &str) -> Option<&'static str> {
+    match value.to_ascii_lowercase().as_str() {
+        "image/jpeg" | "jpeg" | "jpg" => Some("jpg"),
+        "image/png" | "png" => Some("png"),
+        "image/bmp" | "bmp" => Some("bmp"),
+        _ => None,
+    }
 }
 
 fn generated_normals(p: &[[f32; 3]], indices: &[u32]) -> Vec<[f32; 3]> {
