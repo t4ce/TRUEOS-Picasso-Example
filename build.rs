@@ -13,6 +13,11 @@ const ASSETS: [(&str, &str); 5] = [
     ("RiggedSimple", "Assets/RiggedSimple/RiggedSimple.glb"),
 ];
 
+// Keep source textures prepared in Picasso's database, but have this demo use
+// the established opaque POS+normal retained path until its sampled-material
+// presentation is re-enabled.
+const ENABLE_SAMPLED_MATERIAL: bool = false;
+
 fn main() {
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set"));
     let mut catalog = String::from(
@@ -21,7 +26,13 @@ fn main() {
     for (slot, (name, source)) in ASSETS.iter().enumerate() {
         println!("cargo:rerun-if-changed={source}");
         let source_path = Path::new(source);
-        let (vertices, indices, base_color, vertex_stride) = prepare(source_path);
+        let PreparedGeometry {
+            vertices,
+            indices,
+            base_color,
+            vertex_stride,
+            primitives: prepared_primitives,
+        } = prepare(source_path, ENABLE_SAMPLED_MATERIAL);
         let stem = name.to_ascii_lowercase();
         let vertex_file = format!("{stem}.posnormal.f32le");
         let index_file = format!("{stem}.indices.u32le");
@@ -37,13 +48,58 @@ fn main() {
         } else {
             (String::new(), String::from("&[]"))
         };
-        catalog.push_str(&format!("PreparedAsset {{ name: \"{name}\", vertices: include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{vertex_file}\")), indices: include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{index_file}\")), vertex_count: {}, index_count: {}, vertex_stride: {vertex_stride}, base_color_name: \"{base_color_name}\", base_color_bytes: {base_color_bytes}, sampled_material: {}, helmet_program: {} }},\n", vertices.len()/vertex_stride, indices.len()/4, !base_color_name.is_empty(), slot==0));
+        let primitives = prepared_primitives
+            .iter()
+            .map(|primitive| format!(
+                "PreparedPrimitive {{ topology: PrimitiveTopology::{}, first_vertex: {}, vertex_count: {}, first_index: {}, index_count: {}, double_sided: {} }}",
+                primitive.topology,
+                primitive.first_vertex,
+                primitive.vertex_count,
+                primitive.first_index,
+                primitive.index_count,
+                primitive.double_sided,
+            ))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let retained_topology = prepared_primitives
+            .first()
+            .filter(|first| {
+                prepared_primitives
+                    .iter()
+                    .all(|primitive| primitive.topology == first.topology)
+            })
+            .map(|primitive| format!("Some(PrimitiveTopology::{})", primitive.topology))
+            .unwrap_or_else(|| String::from("None"));
+        // One retained mesh currently contains all source primitives. If their
+        // cull policies differ, disable culling conservatively: that keeps
+        // every glTF `doubleSided` face visible until material batching exists.
+        let retained_double_sided = prepared_primitives
+            .iter()
+            .any(|primitive| primitive.double_sided);
+        catalog.push_str(&format!("PreparedAsset {{ name: \"{name}\", vertices: include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{vertex_file}\")), indices: include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{index_file}\")), vertex_count: {}, index_count: {}, vertex_stride: {vertex_stride}, base_color_name: \"{base_color_name}\", base_color_bytes: {base_color_bytes}, sampled_material: {}, helmet_program: {}, primitives: &[{primitives}], retained_topology: {retained_topology}, retained_double_sided: {retained_double_sided} }},\n", vertices.len()/vertex_stride, indices.len()/4, ENABLE_SAMPLED_MATERIAL && !base_color_name.is_empty(), slot==0));
     }
     catalog.push_str("];\n");
     fs::write(out.join("prepared_assets.rs"), catalog).expect("write asset catalog");
 }
 
-fn prepare(source: &Path) -> (Vec<u8>, Vec<u8>, Option<(&'static str, Vec<u8>)>, usize) {
+struct PreparedGeometry {
+    vertices: Vec<u8>,
+    indices: Vec<u8>,
+    base_color: Option<(&'static str, Vec<u8>)>,
+    vertex_stride: usize,
+    primitives: Vec<PreparedPrimitive>,
+}
+
+struct PreparedPrimitive {
+    topology: &'static str,
+    first_vertex: u32,
+    vertex_count: u32,
+    first_index: u32,
+    index_count: u32,
+    double_sided: bool,
+}
+
+fn prepare(source: &Path, sampled_material: bool) -> PreparedGeometry {
     let bytes = fs::read(source).expect("read asset");
     let parsed = gltf::Gltf::from_slice(&bytes).expect("parse asset");
     let base = source.parent().unwrap_or(Path::new("."));
@@ -68,23 +124,20 @@ fn prepare(source: &Path) -> (Vec<u8>, Vec<u8>, Option<(&'static str, Vec<u8>)>,
                 .map(|info| info.texture().source().source())
         })
         .and_then(|image| load_supported_image(image, &buffers, base));
-    let sampled_material = base_color.is_some();
+    let sampled_material = sampled_material && base_color.is_some();
     let (mut positions, mut normals, mut uvs, mut indices) = (
         Vec::<[f32; 3]>::new(),
         Vec::<[f32; 3]>::new(),
         Vec::<[f32; 2]>::new(),
         Vec::<u32>::new(),
     );
+    let mut primitives = Vec::<PreparedPrimitive>::new();
     for mesh in parsed.meshes() {
         for primitive in mesh.primitives() {
-            assert_eq!(
-                primitive.mode(),
-                gltf::mesh::Mode::Triangles,
-                "only triangle assets are supported"
-            );
             let reader = primitive.reader(|b| Some(buffers[b.index()].as_slice()));
             let base_vertex = positions.len() as u32;
             let p: Vec<_> = reader.read_positions().expect("POSITION").collect();
+            let vertex_count = p.len() as u32;
             let local: Vec<u32> = reader
                 .read_indices()
                 .map(|v| v.into_u32().collect())
@@ -92,7 +145,7 @@ fn prepare(source: &Path) -> (Vec<u8>, Vec<u8>, Option<(&'static str, Vec<u8>)>,
             let n: Vec<_> = reader
                 .read_normals()
                 .map(|v| v.collect())
-                .unwrap_or_else(|| generated_normals(&p, &local));
+                .unwrap_or_else(|| generated_normals(primitive.mode(), &p, &local));
             let uv: Vec<_> = reader
                 .read_tex_coords(0)
                 .map(|coords| coords.into_f32().collect())
@@ -102,7 +155,17 @@ fn prepare(source: &Path) -> (Vec<u8>, Vec<u8>, Option<(&'static str, Vec<u8>)>,
             positions.extend(p);
             normals.extend(n);
             uvs.extend(uv);
+            let first_index = indices.len() as u32;
+            let index_count = local.len() as u32;
             indices.extend(local.into_iter().map(|i| i + base_vertex));
+            primitives.push(PreparedPrimitive {
+                topology: primitive_topology(primitive.mode()),
+                first_vertex: base_vertex,
+                vertex_count,
+                first_index,
+                index_count,
+                double_sided: primitive.material().double_sided(),
+            });
         }
     }
     assert!(!positions.is_empty() && !indices.is_empty());
@@ -123,7 +186,25 @@ fn prepare(source: &Path) -> (Vec<u8>, Vec<u8>, Option<(&'static str, Vec<u8>)>,
     for i in indices {
         ib.extend(i.to_le_bytes());
     }
-    (vb, ib, base_color, vertex_stride)
+    PreparedGeometry {
+        vertices: vb,
+        indices: ib,
+        base_color,
+        vertex_stride,
+        primitives,
+    }
+}
+
+fn primitive_topology(mode: gltf::mesh::Mode) -> &'static str {
+    match mode {
+        gltf::mesh::Mode::Points => "PointList",
+        gltf::mesh::Mode::Lines => "LineList",
+        gltf::mesh::Mode::LineLoop => "LineLoop",
+        gltf::mesh::Mode::LineStrip => "LineStrip",
+        gltf::mesh::Mode::Triangles => "TriangleList",
+        gltf::mesh::Mode::TriangleStrip => "TriangleStrip",
+        gltf::mesh::Mode::TriangleFan => "TriangleFan",
+    }
 }
 
 fn load_supported_image(
@@ -172,24 +253,60 @@ fn supported_image_extension(value: &str) -> Option<&'static str> {
     }
 }
 
-fn generated_normals(p: &[[f32; 3]], indices: &[u32]) -> Vec<[f32; 3]> {
+fn generated_normals(mode: gltf::mesh::Mode, p: &[[f32; 3]], indices: &[u32]) -> Vec<[f32; 3]> {
     let mut out = vec![[0.0; 3]; p.len()];
-    for tri in indices.chunks_exact(3) {
-        let a = p[tri[0] as usize];
-        let b = p[tri[1] as usize];
-        let c = p[tri[2] as usize];
-        let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-        let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+    let mut add_triangle = |a: u32, b: u32, c: u32| {
+        let a_position = p[a as usize];
+        let b_position = p[b as usize];
+        let c_position = p[c as usize];
+        let u = [
+            b_position[0] - a_position[0],
+            b_position[1] - a_position[1],
+            b_position[2] - a_position[2],
+        ];
+        let v = [
+            c_position[0] - a_position[0],
+            c_position[1] - a_position[1],
+            c_position[2] - a_position[2],
+        ];
         let n = [
             u[1] * v[2] - u[2] * v[1],
             u[2] * v[0] - u[0] * v[2],
             u[0] * v[1] - u[1] * v[0],
         ];
-        for &i in tri {
+        for i in [a, b, c] {
             for a in 0..3 {
                 out[i as usize][a] += n[a];
             }
         }
+    };
+    match mode {
+        gltf::mesh::Mode::Triangles => {
+            for triangle in indices.chunks_exact(3) {
+                add_triangle(triangle[0], triangle[1], triangle[2]);
+            }
+        }
+        gltf::mesh::Mode::TriangleStrip => {
+            for (index, triangle) in indices.windows(3).enumerate() {
+                let [a, b, c] = [triangle[0], triangle[1], triangle[2]];
+                if index.is_multiple_of(2) {
+                    add_triangle(a, b, c);
+                } else {
+                    add_triangle(b, a, c);
+                }
+            }
+        }
+        gltf::mesh::Mode::TriangleFan => {
+            if let Some(&center) = indices.first() {
+                for triangle in indices[1..].windows(2) {
+                    add_triangle(center, triangle[0], triangle[1]);
+                }
+            }
+        }
+        gltf::mesh::Mode::Points
+        | gltf::mesh::Mode::Lines
+        | gltf::mesh::Mode::LineLoop
+        | gltf::mesh::Mode::LineStrip => {}
     }
     for n in &mut out {
         let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();

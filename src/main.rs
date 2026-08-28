@@ -15,9 +15,11 @@ use trueos::ui4_scene::{
 };
 use trueos::vgpu::{
     BUFFER_USAGE_INDEX, BUFFER_USAGE_MAP_WRITE, BUFFER_USAGE_VERTEX, Buffer, BufferSlice,
-    Capabilities, Device, IndexedBatchDrawV2, Queue, QueueClass, RETAINED_VERTEX_LAYOUT_POS_NORMAL,
-    RETAINED_VERTEX_LAYOUT_POS_NORMAL_UV, RetainedFrameSubmit, RetainedMesh,
-    RetainedMeshDescriptor, RetainedTransformSeed, VVideoMem,
+    Capabilities, Device, PRIMITIVE_TOPOLOGY_LINE_LIST, PRIMITIVE_TOPOLOGY_LINE_LOOP,
+    PRIMITIVE_TOPOLOGY_LINE_STRIP, PRIMITIVE_TOPOLOGY_POINT_LIST, PRIMITIVE_TOPOLOGY_TRIANGLE_FAN,
+    PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, Queue, QueueClass,
+    RETAINED_VERTEX_LAYOUT_POS_NORMAL, RETAINED_VERTEX_LAYOUT_POS_NORMAL_UV, RetainedCamera,
+    RetainedFrameSubmit, RetainedMesh, RetainedMeshDescriptor, RetainedTransformSeed, VVideoMem,
 };
 use trueos::{
     clock,
@@ -25,8 +27,6 @@ use trueos::{
     vsys,
 };
 use trueos_picasso::ExecRing;
-use trueos_picasso::GRID_INDICES;
-use trueos_picasso::GRID_VERTICES;
 use trueos_picasso::Picasso;
 use trueos_picasso::cam::{Camera, FlyCam, Projection, Quaternion};
 use trueos_picasso::{CubismError, SharedByteRange, VVideoRingError, VisibilityOps};
@@ -46,6 +46,40 @@ pub struct PreparedAsset {
     pub base_color_bytes: &'static [u8],
     pub sampled_material: bool,
     pub helmet_program: bool,
+    /// Every glTF primitive imported from this asset.  The current retained
+    /// presentation consumes triangle lists, but import keeps the source
+    /// topology intact for topology-capable consumers.
+    pub primitives: &'static [PreparedPrimitive],
+    /// A whole retained mesh has one native topology. Mixed-topology glTF
+    /// assets remain losslessly prepared above and will become one retained
+    /// mesh per primitive when multi-draw retained submission is introduced.
+    pub retained_topology: Option<PrimitiveTopology>,
+    /// True when a source material declares glTF `doubleSided`.
+    pub retained_double_sided: bool,
+}
+
+/// One primitive's ranges in a build-prepared asset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreparedPrimitive {
+    pub topology: PrimitiveTopology,
+    pub first_vertex: u32,
+    pub vertex_count: u32,
+    pub first_index: u32,
+    pub index_count: u32,
+    /// Source glTF material's `doubleSided` value.
+    pub double_sided: bool,
+}
+
+const fn vgpu_topology(topology: PrimitiveTopology) -> u32 {
+    match topology {
+        PrimitiveTopology::PointList => PRIMITIVE_TOPOLOGY_POINT_LIST,
+        PrimitiveTopology::LineList => PRIMITIVE_TOPOLOGY_LINE_LIST,
+        PrimitiveTopology::LineLoop => PRIMITIVE_TOPOLOGY_LINE_LOOP,
+        PrimitiveTopology::LineStrip => PRIMITIVE_TOPOLOGY_LINE_STRIP,
+        PrimitiveTopology::TriangleList => PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+        PrimitiveTopology::TriangleStrip => PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP,
+        PrimitiveTopology::TriangleFan => PRIMITIVE_TOPOLOGY_TRIANGLE_FAN,
+    }
 }
 include!(concat!(env!("OUT_DIR"), "/prepared_assets.rs"));
 
@@ -60,8 +94,6 @@ struct DatabasePreparedAsset {
 
 struct DatabasePreparedCatalog {
     assets: Vec<DatabasePreparedAsset>,
-    line_vertices: Vec<u8>,
-    line_indices: Vec<u8>,
 }
 
 pub const HELMET_VERTEX_COUNT: u32 = ASSETS[0].vertex_count;
@@ -87,41 +119,6 @@ pub static HELMET_TRANSFORM_REFS_U32: &[u8; 16] = &[
 
 pub static HELMET_POSNORMAL: &[u8] = ASSETS[0].vertices;
 pub static HELMET_INDICES_U32: &[u8] = ASSETS[0].indices;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct MixedTopologyDraw {
-    index_count: u32,
-    first_index: u32,
-    base_vertex: i32,
-    rgba8_srgb: u32,
-    topology: PrimitiveTopology,
-}
-
-fn mixed_topology_plan(
-    helmet_index_count: u32,
-    helmet_vertex_count: u32,
-) -> [MixedTopologyDraw; 4] {
-    let mut draws = [MixedTopologyDraw {
-        index_count: helmet_index_count,
-        first_index: 0,
-        base_vertex: 0,
-        rgba8_srgb: u32::from_le_bytes([210, 215, 225, 255]),
-        topology: PrimitiveTopology::TriangleList,
-    }; 4];
-    for (slot, rgba) in [[255, 32, 32, 255], [32, 255, 32, 255], [32, 96, 255, 255]]
-        .into_iter()
-        .enumerate()
-    {
-        draws[slot + 1] = MixedTopologyDraw {
-            index_count: 2,
-            first_index: helmet_index_count + slot as u32 * 2,
-            base_vertex: (helmet_vertex_count + slot as u32 * 2) as i32,
-            rgba8_srgb: u32::from_le_bytes(rgba),
-            topology: PrimitiveTopology::LineList,
-        };
-    }
-    draws
-}
 
 /// Describe the host-prepared DamagedHelmet geometry without runtime parsing.
 pub const fn prepared_geometry() -> ExecutablePrimitive {
@@ -163,13 +160,12 @@ pub struct HeadInstanceProgram {
 // Preserve the distance of the former first offset helmet from the origin,
 // then use it as the signed X/Y offset for a symmetric 2-by-2 layout.
 const HEAD_PLANE_OFFSET: f32 = 1.6;
-const WORLD_AXIS_LENGTH: f32 = 2.0;
-const CLIPPED_CAMERA_POINT: [f32; 3] = [2.0, 2.0, 1.0];
+const HELMET_SCALE: f32 = 0.9;
 /// Editor-style camera speed in world units per second.
-const FLYCAM_SPEED: f32 = 3.0;
+const FLYCAM_SPEED: f32 = 1.5;
 /// Camera-local quaternion look angle applied for one pixel of cursor motion.
 const FLYCAM_LOOK_SENSITIVITY: f32 = 0.002;
-const PRESENTATION_CAMERA_POSITION: [f32; 3] = [0.0, 0.0, -10.0];
+const PRESENTATION_CAMERA_POSITION: [f32; 3] = [0.0, 0.0, -5.0];
 const PRESENTATION_CAMERA_TARGET: [f32; 3] = [0.0; 3];
 const PRESENTATION_CAMERA_WORLD_UP: [f32; 3] = [0.0, -1.0, 0.0];
 const HEAD_WORLD_TRANSLATIONS: [[f32; 3]; HEAD_INSTANCE_COUNT as usize] = [
@@ -180,8 +176,7 @@ const HEAD_WORLD_TRANSLATIONS: [[f32; 3]; HEAD_INSTANCE_COUNT as usize] = [
     [HEAD_PLANE_OFFSET, -HEAD_PLANE_OFFSET, 0.0],
 ];
 
-/// Initial Blender-style editor camera. Retained transforms and the world-axis
-/// guide are projected from its current view as the user flies through space.
+/// Initial Blender-style editor camera for the retained scene.
 fn presentation_camera() -> Camera {
     Camera {
         // Sit on the world-blue axis and keep the origin centred as the aim
@@ -196,7 +191,7 @@ fn presentation_camera() -> Camera {
         ),
         projection: Projection::Perspective {
             yfov: core::f32::consts::FRAC_PI_3,
-            znear: 1.0,
+            znear: 0.1,
             zfar: Some(100.0),
             aspect_ratio: None,
         },
@@ -261,7 +256,7 @@ const fn placed_head(x: f32, y: f32) -> TransformValue {
         translation: [x, y, 0.0],
         translation_pad: 0.0,
         rotation: [0.0, 0.0, 0.0, 1.0],
-        scale: [0.45, 0.45, 0.45],
+        scale: [HELMET_SCALE; 3],
         scale_pad: 0.0,
     }
 }
@@ -330,14 +325,8 @@ pub struct GeometryProbe {
     frame: Frame,
     device: Device,
     queue: Queue,
-    _asset_vertex_buffers: [Option<Buffer>; ASSET_COUNT],
-    _asset_index_buffers: [Option<Buffer>; ASSET_COUNT],
-    line_vertex_buffer: Buffer,
-    line_index_buffer: Buffer,
-    line_world_vertices: Vec<u8>,
-    line_projection_camera: Camera,
-    line_projection_extent: (u32, u32),
-    line_vertex_revision: u32,
+    asset_vertex_buffers: [Option<Buffer>; ASSET_COUNT],
+    asset_index_buffers: [Option<Buffer>; ASSET_COUNT],
     base_color_textures: [Option<trueos::vmedia::RetainedTexture>; ASSET_COUNT],
     retained_meshes: [Option<RetainedMesh>; ASSET_COUNT],
     selected_asset: usize,
@@ -346,6 +335,7 @@ pub struct GeometryProbe {
     resize_drag: Option<ResizeDrag>,
     timeline: u64,
     previous_elapsed_millis: u64,
+    previous_view_projection: [f32; 16],
 }
 
 #[derive(Clone, Copy)]
@@ -359,13 +349,12 @@ struct ResizeDrag {
 
 impl GeometryProbe {
     fn open(catalog: &DatabasePreparedCatalog) -> Result<Self, GeometryProbeError> {
-        const WIDTH: u32 = 640;
-        const HEIGHT: u32 = 360;
+        // 784×441 is exact 16:9 and 1.5× the former 640×360 surface area.
+        // This remains an ordinary positioned UI4 frame, not fullscreen.
+        const WIDTH: u32 = 784;
+        const HEIGHT: u32 = 441;
 
-        if catalog.assets.len() != ASSET_COUNT
-            || catalog.line_vertices.len() != core::mem::size_of_val(&GRID_VERTICES)
-            || catalog.line_indices.len() != core::mem::size_of_val(&GRID_INDICES)
-        {
+        if catalog.assets.len() != ASSET_COUNT {
             return Err(GeometryProbeError::Contract);
         }
 
@@ -381,7 +370,17 @@ impl GeometryProbe {
             return Err(GeometryProbeError::Contract);
         }
 
-        let frame = Frame::open_streaming(120, 96, WIDTH, HEIGHT)
+        let (initial_x, initial_y) = output_dimensions()
+            .map(|(output_width, output_height)| {
+                (
+                    i32::try_from(output_width.saturating_sub(WIDTH) / 2).unwrap_or(0),
+                    i32::try_from(output_height.saturating_sub(HEIGHT) / 2).unwrap_or(0),
+                )
+            })
+            // Positioning is optional presentation polish; preserve the old
+            // request if UI4 cannot report an output extent during startup.
+            .unwrap_or((120, 96));
+        let frame = Frame::open_streaming(initial_x, initial_y, WIDTH, HEIGHT)
             .map_err(|error| GeometryProbeError::Ui4("frame-open", error))?;
         let device = Device::open(Capabilities::DEFAULT.union(Capabilities::PRESENT))
             .map_err(|code| GeometryProbeError::Vgpu("device-open", code))?;
@@ -428,6 +427,15 @@ impl GeometryProbe {
                         } else {
                             RETAINED_VERTEX_LAYOUT_POS_NORMAL
                         },
+                        topology: vgpu_topology(
+                            asset
+                                .retained_topology
+                                .ok_or(GeometryProbeError::Contract)?,
+                        ) | if asset.retained_double_sided {
+                            trueos::vgpu::RETAINED_MESH_FLAG_DOUBLE_SIDED
+                        } else {
+                            0
+                        },
                         ..RetainedMeshDescriptor::default()
                     },
                 )
@@ -436,44 +444,16 @@ impl GeometryProbe {
             asset_index_buffers[slot] = Some(index_buffer);
             retained_meshes[slot] = Some(retained_mesh);
         }
-        let line_vertex_buffer = device
-            .create_buffer(
-                catalog.line_vertices.len(),
-                BUFFER_USAGE_MAP_WRITE | BUFFER_USAGE_VERTEX,
-            )
-            .map_err(|code| GeometryProbeError::Vgpu("line-vertex-buffer-create", code))?;
-        let line_index_buffer = device
-            .create_buffer(
-                catalog.line_indices.len(),
-                BUFFER_USAGE_MAP_WRITE | BUFFER_USAGE_INDEX,
-            )
-            .map_err(|code| GeometryProbeError::Vgpu("line-index-buffer-create", code))?;
-
-        // Static draws do not inherit the retained carrier's transform seed.
-        // Keep their Picasso DB world-space source so it can be reprojected
-        // whenever the editor camera moves or the viewport changes.
         let camera = presentation_camera();
-        let line_world_vertices = catalog.line_vertices.clone();
-        let projected_line_vertices =
-            project_static_line_vertices(&line_world_vertices, camera, WIDTH, HEIGHT)
-                .ok_or(GeometryProbeError::Contract)?;
-        write_exact(device, line_vertex_buffer, 0, &projected_line_vertices)
-            .map_err(|code| GeometryProbeError::Vgpu("line-vertex-upload", code))?;
-        write_exact(device, line_index_buffer, 0, &catalog.line_indices)
-            .map_err(|code| GeometryProbeError::Vgpu("line-index-upload", code))?;
+        let previous_view_projection =
+            retained_camera(camera, WIDTH, HEIGHT, [0.0; 16]).view_projection;
 
         let mut probe = Self {
             frame,
             device,
             queue,
-            _asset_vertex_buffers: asset_vertex_buffers,
-            _asset_index_buffers: asset_index_buffers,
-            line_vertex_buffer,
-            line_index_buffer,
-            line_world_vertices,
-            line_projection_camera: camera,
-            line_projection_extent: (WIDTH, HEIGHT),
-            line_vertex_revision: 1,
+            asset_vertex_buffers,
+            asset_index_buffers,
             base_color_textures: core::array::from_fn(|_| None),
             retained_meshes,
             selected_asset: 0,
@@ -482,13 +462,13 @@ impl GeometryProbe {
             resize_drag: None,
             timeline: 0,
             previous_elapsed_millis: 0,
+            previous_view_projection,
         };
         // Move the Blender-style editor camera, never the world objects.
-        // The world-axis guide is reprojected from this same camera below.
         probe.flycam.set_look_sensitivity(FLYCAM_LOOK_SENSITIVITY);
         for (slot, asset) in ASSETS.iter().enumerate() {
             let encoded = &catalog.assets[slot].base_color;
-            if encoded.is_empty() {
+            if !asset.sampled_material || encoded.is_empty() {
                 continue;
             }
             let texture = trueos::async_fs::block_on(trueos::vmedia::decode_retained_asset(
@@ -532,9 +512,7 @@ impl GeometryProbe {
         Ok(probe)
     }
 
-    /// Advance the camera/compact transform state and render one complete
-    /// frame. Mesh mappings remain resident; camera changes rewrite only the
-    /// six world-axis positions before their in-place resident refresh.
+    /// Advance the camera/compact transform state and render one complete frame.
     pub fn render_frame(&mut self, elapsed_millis: u64) -> Result<(), GeometryProbeError> {
         let delta_seconds =
             elapsed_millis.saturating_sub(self.previous_elapsed_millis) as f32 * 0.001;
@@ -546,31 +524,12 @@ impl GeometryProbe {
         self.service_frame_interaction()?;
         let width = self.frame.width();
         let height = self.frame.height();
-
-        // The line-list path has no retained transform seed. Refresh only its
-        // projected vertex bytes when the editor camera or viewport changes;
-        // helmet positions remain immutable world-space transforms.
-        if self.flycam.camera != self.line_projection_camera
-            || (width, height) != self.line_projection_extent
-        {
-            let projected_line_vertices = project_static_line_vertices(
-                &self.line_world_vertices,
-                self.flycam.camera,
-                width,
-                height,
-            )
-            .ok_or(GeometryProbeError::Contract)?;
-            write_exact(
-                self.device,
-                self.line_vertex_buffer,
-                0,
-                &projected_line_vertices,
-            )
-            .map_err(|code| GeometryProbeError::Vgpu("line-vertex-reproject", code))?;
-            self.line_vertex_revision = self.line_vertex_revision.wrapping_add(1).max(1);
-            self.line_projection_camera = self.flycam.camera;
-            self.line_projection_extent = (width, height);
-        }
+        let camera = retained_camera(
+            self.flycam.camera,
+            width,
+            height,
+            self.previous_view_projection,
+        );
 
         self.frame
             .begin_gpu_frame()
@@ -585,9 +544,12 @@ impl GeometryProbe {
                 self.queue,
                 surface,
                 self.retained_meshes[self.selected_asset].ok_or(GeometryProbeError::Contract)?,
-                self.line_vertex_buffer,
-                self.line_index_buffer,
+                self.asset_vertex_buffers[self.selected_asset]
+                    .ok_or(GeometryProbeError::Contract)?,
+                self.asset_index_buffers[self.selected_asset]
+                    .ok_or(GeometryProbeError::Contract)?,
                 RetainedFrameSubmit {
+                    camera,
                     base_color_texture: if ASSETS[self.selected_asset].sampled_material {
                         self.base_color_textures[self.selected_asset]
                             .as_ref()
@@ -598,16 +560,10 @@ impl GeometryProbe {
                     },
                     clear_rgba8_srgb: u32::from_le_bytes([0, 128, 0, 0]),
                     seed_count: retained_seed_count(ASSETS[self.selected_asset].helmet_program),
-                    static_draw_count: 3,
-                    static_vertex_revision: self.line_vertex_revision,
                     seeds: retained_seeds(
                         elapsed_millis,
-                        self.flycam.camera,
                         ASSETS[self.selected_asset].helmet_program,
-                        width,
-                        height,
                     ),
-                    static_draws: retained_line_draws(),
                     ..RetainedFrameSubmit::default()
                 },
             )
@@ -619,6 +575,7 @@ impl GeometryProbe {
             .publish(Damage::full(width, height))
             .map_err(|error| GeometryProbeError::Ui4("frame-publish", error))?;
         self.timeline = point.value;
+        self.previous_view_projection = camera.view_projection;
         Ok(())
     }
 
@@ -762,25 +719,9 @@ impl GeometryProbe {
     }
 }
 
-fn retained_line_draws() -> [IndexedBatchDrawV2; trueos::vgpu::MAX_RETAINED_STATIC_DRAWS] {
-    core::array::from_fn(|slot| IndexedBatchDrawV2 {
-        index_count: 2,
-        first_index: slot as u32 * 2,
-        base_vertex: slot as i32 * 2,
-        rgba8_srgb: u32::from_le_bytes(
-            [[255, 32, 32, 255], [32, 255, 32, 255], [32, 96, 255, 255]][slot],
-        ),
-        topology: trueos::vgpu::PRIMITIVE_TOPOLOGY_LINE_LIST,
-        reserved: 0,
-    })
-}
-
 fn retained_seeds(
     elapsed_millis: u64,
-    camera: Camera,
     helmet_program: bool,
-    viewport_width: u32,
-    viewport_height: u32,
 ) -> [RetainedTransformSeed; trueos::vgpu::MAX_RETAINED_TRANSFORM_SEEDS] {
     let seconds = elapsed_millis as f32 * 0.001;
     let half_angle = core::f32::consts::FRAC_PI_4 * seconds;
@@ -788,8 +729,6 @@ fn retained_seeds(
     let counter_clockwise = [0.0, 0.0, libm::sinf(half_angle), libm::cosf(half_angle)];
     let half_cycle = (elapsed_millis % 1_000) as f32;
     let pulse = libm::fabsf(half_cycle - 500.0) / 500.0;
-    let [qx, qy, qz, qw] = camera.rotation.normalized().0;
-    let view_rotation = Quaternion([-qx, -qy, -qz, qw]);
     let mut seeds = [RetainedTransformSeed::default(); trueos::vgpu::MAX_RETAINED_TRANSFORM_SEEDS];
     for (slot, seed) in seeds
         .iter_mut()
@@ -801,11 +740,6 @@ fn retained_seeds(
         } else {
             [0.0; 3]
         };
-        let view_translation = view_rotation.rotate([
-            world_translation[0] - camera.position[0],
-            world_translation[1] - camera.position[1],
-            world_translation[2] - camera.position[2],
-        ]);
         let world_rotation = match slot {
             _ if !helmet_program => [0.0, 0.0, 0.0, 1.0],
             0 => clockwise,
@@ -815,23 +749,22 @@ fn retained_seeds(
         let world_scale = if !helmet_program {
             1.0
         } else if slot == 2 {
-            0.45 * pulse
+            HELMET_SCALE * pulse
         } else {
-            0.45
+            HELMET_SCALE
         };
-        let (projected_translation, projected_scale) = project_camera_transform(
-            camera.projection,
-            viewport_width,
-            viewport_height,
-            view_translation,
-            world_scale,
-        );
         *seed = RetainedTransformSeed {
-            translation: projected_translation,
-            scale: projected_scale,
-            rotation: (view_rotation * Quaternion(world_rotation)).normalized().0,
+            // Keep object TRS in world space.  The retained vertex shader
+            // applies the live `camera.view_projection` after this model
+            // matrix, so local Z is never converted into a screen-space scale.
+            translation: world_translation,
+            scale: [world_scale; 3],
+            rotation: world_rotation,
             local_radius: 1.0,
-            previous_translation: view_translation,
+            previous_translation: world_translation,
+            // All four instances are compacted into the retained mesh's one
+            // proven draw group. The upper 16 bits select each instance's
+            // group-local compaction slot.
             draw_group: 0,
             flags: (slot as u32) << 16,
         };
@@ -839,57 +772,80 @@ fn retained_seeds(
     seeds
 }
 
-/// Picasso's retained carrier currently owns an identity camera matrix. Fold
-/// the runtime camera into each compact model seed so geometry remains GPU
-/// transformed without a second vertex upload. All current demo objects share
-/// one Z plane, making this center-depth perspective representation exact for
-/// placement and stable for the small normalized meshes.
-fn project_camera_transform(
-    projection: Projection,
+/// Build the shader's WGSL-compatible camera block.  Model seeds remain in
+/// world space; this is the one normal `projection * view * model` path.
+fn retained_camera(
+    camera: Camera,
     viewport_width: u32,
     viewport_height: u32,
-    view_translation: [f32; 3],
-    world_scale: f32,
-) -> ([f32; 3], [f32; 3]) {
-    match projection {
+    previous_view_projection: [f32; 16],
+) -> RetainedCamera {
+    let [qx, qy, qz, qw] = camera.rotation.normalized().0;
+    let world_to_view = Quaternion([-qx, -qy, -qz, qw]);
+    let x_axis = world_to_view.rotate([1.0, 0.0, 0.0]);
+    let y_axis = world_to_view.rotate([0.0, 1.0, 0.0]);
+    let z_axis = world_to_view.rotate([0.0, 0.0, 1.0]);
+    let translation = world_to_view.rotate([
+        -camera.position[0],
+        -camera.position[1],
+        -camera.position[2],
+    ]);
+    // WGSL matrices are column-major. `world_to_view.rotate(e_i)` is column i
+    // of the rotation, and the fourth column supplies camera translation.
+    let view = [
+        x_axis[0],
+        x_axis[1],
+        x_axis[2],
+        0.0,
+        y_axis[0],
+        y_axis[1],
+        y_axis[2],
+        0.0,
+        z_axis[0],
+        z_axis[1],
+        z_axis[2],
+        0.0,
+        translation[0],
+        translation[1],
+        translation[2],
+        1.0,
+    ];
+    let (projection, znear, zfar) = match camera.projection {
         Projection::Perspective {
             yfov,
             znear,
             zfar,
             aspect_ratio,
         } => {
-            let depth = -view_translation[2];
-            if depth < znear || zfar.is_some_and(|far| depth > far) {
-                return (CLIPPED_CAMERA_POINT, [0.0; 3]);
-            }
             let aspect = aspect_ratio
                 .unwrap_or_else(|| viewport_width as f32 / viewport_height.max(1) as f32);
             let focal_y = 1.0 / libm::tanf(yfov * 0.5);
-            let focal_x = focal_y / aspect;
-            let (ndc_z, depth_scale) = match zfar {
-                Some(far) => {
-                    let range = (far - znear).max(f32::EPSILON);
-                    (
-                        far / range - far * znear / (range * depth),
-                        far * znear / (range * depth * depth),
-                    )
-                }
-                None => (1.0 - znear / depth, znear / (depth * depth)),
+            let focal_x = focal_y / aspect.max(f32::EPSILON);
+            let (depth_scale, depth_offset) = match zfar {
+                Some(zfar) => (zfar / (znear - zfar), zfar * znear / (znear - zfar)),
+                None => (-1.0, -znear),
             };
             (
                 [
-                    view_translation[0] * focal_x / depth,
-                    // The retained presentation surface uses a top-left
-                    // screen-space Y convention after this folded projection.
-                    // Negate camera-up here so world +Y rises on screen.
-                    -view_translation[1] * focal_y / depth,
-                    ndc_z,
+                    focal_x,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    focal_y,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    depth_scale,
+                    -1.0,
+                    0.0,
+                    0.0,
+                    depth_offset,
+                    0.0,
                 ],
-                [
-                    world_scale * focal_x / depth,
-                    world_scale * focal_y / depth,
-                    world_scale * depth_scale,
-                ],
+                znear,
+                zfar.unwrap_or(f32::MAX),
             )
         }
         Projection::Orthographic {
@@ -898,143 +854,111 @@ fn project_camera_transform(
             znear,
             zfar,
         } => {
-            let depth = -view_translation[2];
-            if depth < znear || depth > zfar {
-                return (CLIPPED_CAMERA_POINT, [0.0; 3]);
-            }
             let range = (zfar - znear).max(f32::EPSILON);
             (
                 [
-                    view_translation[0] / xmag,
-                    view_translation[1] / ymag,
-                    (depth - znear) / range,
+                    1.0 / xmag.max(f32::EPSILON),
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0 / ymag.max(f32::EPSILON),
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    -1.0 / range,
+                    0.0,
+                    0.0,
+                    0.0,
+                    -znear / range,
+                    1.0,
                 ],
-                [world_scale / xmag, world_scale / ymag, world_scale / range],
+                znear,
+                zfar,
             )
         }
+    };
+    let view_projection = multiply_mat4(projection, view);
+    let inverse_view_projection = invert_mat4(view_projection).unwrap_or(identity_mat4());
+    let forward = camera.rotation.rotate([0.0, 0.0, -1.0]);
+    RetainedCamera {
+        view,
+        projection,
+        view_projection,
+        inverse_view_projection,
+        position_near: [
+            camera.position[0],
+            camera.position[1],
+            camera.position[2],
+            znear,
+        ],
+        forward_far: [forward[0], forward[1], forward[2], zfar],
+        jitter_frame: [0.0; 4],
+        previous_view_projection,
     }
 }
 
-fn camera_depth_range(projection: Projection) -> (f32, Option<f32>) {
-    match projection {
-        Projection::Perspective { znear, zfar, .. } => (znear, zfar),
-        Projection::Orthographic { znear, zfar, .. } => (znear, Some(zfar)),
-    }
+const fn identity_mat4() -> [f32; 16] {
+    [
+        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ]
 }
 
-fn interpolate_view_point(start: [f32; 3], end: [f32; 3], t: f32) -> [f32; 3] {
-    core::array::from_fn(|axis| start[axis] + (end[axis] - start[axis]) * t)
-}
-
-/// Clip one view-space segment to the camera's positive depth interval.
-/// Perspective division happens only after this, preserving a real near-plane
-/// intersection instead of stretching a behind-camera endpoint to the edge.
-fn clip_view_line_to_depth(
-    mut start: [f32; 3],
-    mut end: [f32; 3],
-    znear: f32,
-    zfar: Option<f32>,
-) -> Option<([f32; 3], [f32; 3])> {
-    if !znear.is_finite()
-        || znear <= 0.0
-        || zfar.is_some_and(|far| !far.is_finite() || far <= znear)
-    {
-        return None;
-    }
-
-    let mut start_depth = -start[2];
-    let mut end_depth = -end[2];
-    if start_depth < znear && end_depth < znear {
-        return None;
-    }
-    if start_depth < znear {
-        let t = (znear - start_depth) / (end_depth - start_depth);
-        start = interpolate_view_point(start, end, t);
-        start[2] = -znear;
-    } else if end_depth < znear {
-        let t = (znear - start_depth) / (end_depth - start_depth);
-        end = interpolate_view_point(start, end, t);
-        end[2] = -znear;
-    }
-
-    if let Some(zfar) = zfar {
-        start_depth = -start[2];
-        end_depth = -end[2];
-        if start_depth > zfar && end_depth > zfar {
-            return None;
-        }
-        if start_depth > zfar {
-            let t = (zfar - start_depth) / (end_depth - start_depth);
-            start = interpolate_view_point(start, end, t);
-            start[2] = -zfar;
-        } else if end_depth > zfar {
-            let t = (zfar - start_depth) / (end_depth - start_depth);
-            end = interpolate_view_point(start, end, t);
-            end[2] = -zfar;
+fn multiply_mat4(left: [f32; 16], right: [f32; 16]) -> [f32; 16] {
+    let mut product = [0.0; 16];
+    for column in 0..4 {
+        for row in 0..4 {
+            product[column * 4 + row] = (0..4)
+                .map(|inner| left[inner * 4 + row] * right[column * 4 + inner])
+                .sum();
         }
     }
-    Some((start, end))
+    product
 }
 
-/// Convert Picasso's database-owned float3 world vertices into the clip-space
-/// vertex ABI consumed by retained static draws.  Unlike the retained helmet,
-/// that static path has no transform seed of its own.
-fn project_static_line_vertices(
-    world_vertex_bytes: &[u8],
-    camera: Camera,
-    viewport_width: u32,
-    viewport_height: u32,
-) -> Option<Vec<u8>> {
-    if world_vertex_bytes.len() != core::mem::size_of_val(&GRID_VERTICES)
-        || !world_vertex_bytes.len().is_multiple_of(12)
-    {
-        return None;
-    }
-    let [qx, qy, qz, qw] = camera.rotation.normalized().0;
-    let view_rotation = Quaternion([-qx, -qy, -qz, qw]);
-    let mut view_vertices = Vec::with_capacity(world_vertex_bytes.len() / 12);
-    for bytes in world_vertex_bytes.chunks_exact(12) {
-        let world = [
-            f32::from_le_bytes(bytes[0..4].try_into().ok()?),
-            f32::from_le_bytes(bytes[4..8].try_into().ok()?),
-            f32::from_le_bytes(bytes[8..12].try_into().ok()?),
-        ];
-        if world.iter().any(|component| !component.is_finite()) {
-            return None;
+fn invert_mat4(matrix: [f32; 16]) -> Option<[f32; 16]> {
+    let mut augmented = [[0.0; 8]; 4];
+    for row in 0..4 {
+        for column in 0..4 {
+            augmented[row][column] = matrix[column * 4 + row];
+            augmented[row][column + 4] = if row == column { 1.0 } else { 0.0 };
         }
-        view_vertices.push(view_rotation.rotate([
-            world[0] * WORLD_AXIS_LENGTH - camera.position[0],
-            world[1] * WORLD_AXIS_LENGTH - camera.position[1],
-            world[2] * WORLD_AXIS_LENGTH - camera.position[2],
-        ]));
     }
-
-    let (znear, zfar) = camera_depth_range(camera.projection);
-    let mut projected = Vec::with_capacity(world_vertex_bytes.len());
-    for line in view_vertices.chunks_exact(2) {
-        let points =
-            clip_view_line_to_depth(line[0], line[1], znear, zfar).map(|(start, end)| [start, end]);
-        for clip in points.map_or([CLIPPED_CAMERA_POINT; 2], |points| {
-            points.map(|point| {
-                project_camera_transform(
-                    camera.projection,
-                    viewport_width,
-                    viewport_height,
-                    point,
-                    1.0,
-                )
-                .0
-            })
-        }) {
-            if clip.iter().any(|component| !component.is_finite()) {
-                return None;
+    for pivot_column in 0..4 {
+        let mut pivot_row = pivot_column;
+        for candidate in pivot_column + 1..4 {
+            if libm::fabsf(augmented[candidate][pivot_column])
+                > libm::fabsf(augmented[pivot_row][pivot_column])
+            {
+                pivot_row = candidate;
             }
-            for component in clip {
-                projected.extend_from_slice(&component.to_le_bytes());
+        }
+        let pivot = augmented[pivot_row][pivot_column];
+        if libm::fabsf(pivot) <= f32::EPSILON {
+            return None;
+        }
+        augmented.swap(pivot_column, pivot_row);
+        for value in &mut augmented[pivot_column] {
+            *value /= pivot;
+        }
+        for row in 0..4 {
+            if row == pivot_column {
+                continue;
+            }
+            let factor = augmented[row][pivot_column];
+            for column in 0..8 {
+                augmented[row][column] -= factor * augmented[pivot_column][column];
             }
         }
     }
-    Some(projected)
+    let mut inverse = [0.0; 16];
+    for row in 0..4 {
+        for column in 0..4 {
+            inverse[column * 4 + row] = augmented[row][column + 4];
+        }
+    }
+    Some(inverse)
 }
 
 const fn retained_seed_count(helmet_program: bool) -> u32 {
@@ -1042,24 +966,6 @@ const fn retained_seed_count(helmet_program: bool) -> u32 {
         HEAD_INSTANCE_COUNT
     } else {
         1
-    }
-}
-
-fn line_vertex_bytes() -> &'static [u8] {
-    unsafe {
-        core::slice::from_raw_parts(
-            GRID_VERTICES.as_ptr().cast::<u8>(),
-            core::mem::size_of_val(&GRID_VERTICES),
-        )
-    }
-}
-
-fn line_index_bytes() -> &'static [u8] {
-    unsafe {
-        core::slice::from_raw_parts(
-            GRID_INDICES.as_ptr().cast::<u8>(),
-            core::mem::size_of_val(&GRID_INDICES),
-        )
     }
 }
 
@@ -1200,8 +1106,6 @@ fn put_prepared_assets(picasso: &Picasso) -> Result<(), trueos_picasso::PicassoE
             asset.base_color_bytes,
         )?;
     }
-    picasso.put_embedded_asset("PicassoGrid/prepared/mesh/vertices", line_vertex_bytes())?;
-    picasso.put_embedded_asset("PicassoGrid/prepared/mesh/indices", line_index_bytes())?;
     Ok(())
 }
 
@@ -1231,17 +1135,7 @@ fn load_prepared_assets(
             base_color,
         });
     }
-    let Some(line_vertices) = picasso.embedded_asset("PicassoGrid/prepared/mesh/vertices")? else {
-        return Ok(None);
-    };
-    let Some(line_indices) = picasso.embedded_asset("PicassoGrid/prepared/mesh/indices")? else {
-        return Ok(None);
-    };
-    Ok(Some(DatabasePreparedCatalog {
-        assets,
-        line_vertices,
-        line_indices,
-    }))
+    Ok(Some(DatabasePreparedCatalog { assets }))
 }
 
 fn main() {
@@ -1354,7 +1248,7 @@ fn run() {
     logl::log(
         level::INFO,
         format_args!(
-            "PicassoExample: prepared textured DamagedHelmet instances + static RGB lines submitted and retired: vertices={} indices={} texture_bound={} timeline={}",
+            "PicassoExample: prepared opaque DamagedHelmet instances submitted and retired: vertices={} indices={} texture_bound={} timeline={}",
             HELMET_VERTEX_COUNT,
             HELMET_INDEX_COUNT,
             probe.base_color_textures[0].is_some() as u8,
@@ -1385,7 +1279,7 @@ fn run() {
                 Ok(true) => {
                     logl::log(
                         level::INFO,
-                        "PicassoExample: retained transform + static line frame crossed UI4 SURFLIVE",
+                        "PicassoExample: retained transform frame crossed UI4 SURFLIVE",
                     );
                     presentation_logged = true;
                 }
@@ -1425,6 +1319,23 @@ mod tests {
     impl Drop for Region {
         fn drop(&mut self) {
             unsafe { dealloc(self.ptr, self.layout) }
+        }
+    }
+
+    #[test]
+    fn prepared_primitives_keep_source_ranges_and_topology() {
+        for asset in ASSETS {
+            assert!(!asset.sampled_material);
+            assert_eq!(asset.vertex_stride, 24);
+            assert!(!asset.primitives.is_empty());
+            for primitive in asset.primitives {
+                assert!(primitive.first_vertex < asset.vertex_count);
+                assert!(primitive.vertex_count > 0);
+                assert!(primitive.first_vertex + primitive.vertex_count <= asset.vertex_count);
+                assert!(primitive.first_index < asset.index_count);
+                assert!(primitive.index_count > 0);
+                assert!(primitive.first_index + primitive.index_count <= asset.index_count);
+            }
         }
     }
 
@@ -1506,37 +1417,6 @@ mod tests {
     }
 
     #[test]
-    fn rgb_lines_are_independent_native_line_draws() {
-        let draws = mixed_topology_plan(HELMET_INDEX_COUNT, HELMET_VERTEX_COUNT);
-        assert_eq!(draws[0].topology, PrimitiveTopology::TriangleList);
-        for (slot, expected_rgba) in [[255, 32, 32, 255], [32, 255, 32, 255], [32, 96, 255, 255]]
-            .into_iter()
-            .enumerate()
-        {
-            let draw = draws[slot + 1];
-            assert_eq!(draw.topology, PrimitiveTopology::LineList);
-            assert_eq!(draw.index_count, 2);
-            assert_eq!(draw.first_index, HELMET_INDEX_COUNT + slot as u32 * 2);
-            assert_eq!(
-                draw.base_vertex,
-                (HELMET_VERTEX_COUNT + slot as u32 * 2) as i32
-            );
-            assert_eq!(draw.rgba8_srgb, u32::from_le_bytes(expected_rgba));
-        }
-        assert_eq!(GRID_INDICES, [0, 1, 0, 1, 0, 1]);
-        let draws = retained_line_draws();
-        for (slot, expected_rgba) in [[255, 32, 32, 255], [32, 255, 32, 255], [32, 96, 255, 255]]
-            .into_iter()
-            .enumerate()
-        {
-            assert_eq!(draws[slot].first_index, slot as u32 * 2);
-            assert_eq!(draws[slot].base_vertex, slot as i32 * 2);
-            assert_eq!(draws[slot].index_count, 2);
-            assert_eq!(draws[slot].rgba8_srgb, u32::from_le_bytes(expected_rgba));
-        }
-    }
-
-    #[test]
     fn presentation_camera_stays_on_blue_axis_and_looks_at_origin() {
         let camera = presentation_camera();
         assert_eq!(camera.position, PRESENTATION_CAMERA_POSITION);
@@ -1559,42 +1439,34 @@ mod tests {
             camera.projection,
             Projection::Perspective {
                 yfov: core::f32::consts::FRAC_PI_3,
-                znear: 1.0,
+                znear: 0.1,
                 zfar: Some(100.0),
                 aspect_ratio: None,
             }
         );
 
-        let seeds = retained_seeds(0, camera, true, 640, 360);
+        let seeds = retained_seeds(0, true);
         assert!(seeds[..HEAD_INSTANCE_COUNT as usize].iter().all(|seed| {
             seed.translation
                 .iter()
                 .all(|coordinate| coordinate.is_finite())
         }));
-
-        let projected = project_static_line_vertices(line_vertex_bytes(), camera, 640, 360)
-            .expect("the six finite Picasso grid vertices project");
-        let point = |index: usize| -> [f32; 3] {
-            core::array::from_fn(|axis| {
-                let offset = index * 12 + axis * 4;
-                f32::from_le_bytes(projected[offset..offset + 4].try_into().unwrap())
-            })
-        };
-        let origin = point(0);
-        let x_end = point(1);
-        let y_origin = point(2);
-        let y_end = point(3);
-        let z_origin = point(4);
-        let z_end = point(5);
-        assert_eq!(origin, y_origin);
-        assert_eq!(origin, z_origin);
-        // The upside-down camera makes world +Y project downward on the
-        // top-left-origin retained surface. Looking along +Z makes the blue
-        // axis screen-depth-only at its origin, while X remains horizontal.
-        assert_ne!(x_end, origin);
-        assert!(y_end[1] > origin[1]);
-        assert_eq!([z_end[0], z_end[1]], [origin[0], origin[1]]);
-        assert_ne!(z_end[2], origin[2]);
+        assert!(
+            seeds[..HEAD_INSTANCE_COUNT as usize]
+                .iter()
+                .all(|seed| seed.scale == [HELMET_SCALE; 3])
+        );
+        assert!(
+            seeds[..HEAD_INSTANCE_COUNT as usize]
+                .iter()
+                .all(|seed| seed.draw_group == 0)
+        );
+        assert!(
+            seeds[..HEAD_INSTANCE_COUNT as usize]
+                .iter()
+                .enumerate()
+                .all(|(slot, seed)| seed.flags == (slot as u32) << 16)
+        );
     }
 
     #[test]
@@ -1603,8 +1475,6 @@ mod tests {
         let mut flycam = FlyCam::new(camera, FLYCAM_SPEED);
         flycam.set_look_sensitivity(FLYCAM_LOOK_SENSITIVITY);
         let heads_before = HEAD_WORLD_TRANSLATIONS;
-        let lines_before = project_static_line_vertices(line_vertex_bytes(), camera, 640, 360)
-            .expect("the initial world axes project");
         let forward = camera.rotation.rotate([0.0, 0.0, -1.0]);
 
         flycam.step(
@@ -1623,12 +1493,8 @@ mod tests {
                     < 1.0e-5
             );
         }
-        let lines_after =
-            project_static_line_vertices(line_vertex_bytes(), flycam.camera, 640, 360)
-                .expect("the moved camera reprojects the same world axes");
         flycam.look(32.0, -16.0);
 
-        assert_ne!(lines_after, lines_before);
         assert_ne!(flycam.camera.rotation, camera.rotation);
         assert_eq!(HEAD_WORLD_TRANSLATIONS, heads_before);
         assert_eq!(flycam.speed(), FLYCAM_SPEED);
@@ -1636,34 +1502,15 @@ mod tests {
     }
 
     #[test]
-    fn camera_near_plane_hides_world_geometry_after_flying_through_it() {
+    fn camera_near_plane_is_applied_by_the_gpu_projection_not_cpu_seed_hiding() {
         let mut camera = presentation_camera();
         camera.position = [0.0, 0.0, 3.0];
 
-        let seeds = retained_seeds(0, camera, true, 640, 360);
+        let seeds = retained_seeds(0, true);
         for seed in &seeds[..HEAD_INSTANCE_COUNT as usize] {
-            assert_eq!(seed.translation, CLIPPED_CAMERA_POINT);
-            assert_eq!(seed.scale, [0.0; 3]);
+            assert_ne!(seed.scale, [0.0; 3]);
         }
-
-        let projected = project_static_line_vertices(line_vertex_bytes(), camera, 640, 360)
-            .expect("finite axes behind the camera remain a valid clipped draw");
-        for vertex in projected.chunks_exact(12) {
-            let point: [f32; 3] = core::array::from_fn(|axis| {
-                let offset = axis * 4;
-                f32::from_le_bytes(vertex[offset..offset + 4].try_into().unwrap())
-            });
-            assert_eq!(point, CLIPPED_CAMERA_POINT);
-        }
-
-        let (start, end) =
-            clip_view_line_to_depth([0.0, 0.0, 0.0], [4.0, 0.0, -4.0], 1.0, Some(3.0))
-                .expect("a segment spanning the frustum clips at both depth planes");
-        for (actual, expected) in start.into_iter().zip([1.0, 0.0, -1.0]) {
-            assert!((actual - expected).abs() < 1.0e-5);
-        }
-        for (actual, expected) in end.into_iter().zip([3.0, 0.0, -3.0]) {
-            assert!((actual - expected).abs() < 1.0e-5);
-        }
+        let camera = retained_camera(camera, 640, 360, identity_mat4());
+        assert!(camera.view_projection.iter().all(|value| value.is_finite()));
     }
 }
