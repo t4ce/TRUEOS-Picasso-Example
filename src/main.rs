@@ -4,10 +4,14 @@
 //! receives only stable resource identities and byte-relative ranges.
 #![no_std]
 
+extern crate alloc;
+
 mod demodata;
 
+use alloc::{format, string::String, vec::Vec};
 use trueos::ui4_scene::{
-    CursorIcon, CursorSource, Damage, Frame, POINTER_BUTTON_PRIMARY, output_dimensions,
+    CursorIcon, CursorSource, Damage, Error as Ui4Error, Frame, POINTER_BUTTON_PRIMARY,
+    output_dimensions,
 };
 use trueos::vgpu::{
     BUFFER_USAGE_INDEX, BUFFER_USAGE_MAP_WRITE, BUFFER_USAGE_VERTEX, Buffer, BufferSlice,
@@ -44,6 +48,21 @@ pub struct PreparedAsset {
     pub helmet_program: bool,
 }
 include!(concat!(env!("OUT_DIR"), "/prepared_assets.rs"));
+
+/// Prepared bytes loaded back through Picasso's runtime database boundary.
+/// Static build output is permitted to seed the database, but never to feed a
+/// GPU upload directly.
+struct DatabasePreparedAsset {
+    vertices: Vec<u8>,
+    indices: Vec<u8>,
+    base_color: Vec<u8>,
+}
+
+struct DatabasePreparedCatalog {
+    assets: Vec<DatabasePreparedAsset>,
+    line_vertices: Vec<u8>,
+    line_indices: Vec<u8>,
+}
 
 pub const HELMET_VERTEX_COUNT: u32 = ASSETS[0].vertex_count;
 pub const HELMET_INDEX_COUNT: u32 = ASSETS[0].index_count;
@@ -239,9 +258,16 @@ struct ResizeDrag {
 }
 
 impl GeometryProbe {
-    pub fn open() -> Result<Self, GeometryProbeError> {
+    fn open(catalog: &DatabasePreparedCatalog) -> Result<Self, GeometryProbeError> {
         const WIDTH: u32 = 640;
         const HEIGHT: u32 = 360;
+
+        if catalog.assets.len() != ASSET_COUNT
+            || catalog.line_vertices.len() != core::mem::size_of_val(&GRID_VERTICES)
+            || catalog.line_indices.len() != core::mem::size_of_val(&GRID_INDICES)
+        {
+            return Err(GeometryProbeError::Contract);
+        }
 
         let primitive = prepared_geometry();
         let indices = primitive.indices.ok_or(GeometryProbeError::Contract)?;
@@ -255,8 +281,8 @@ impl GeometryProbe {
             return Err(GeometryProbeError::Contract);
         }
 
-        let mut frame = Frame::open_streaming(120, 96, WIDTH, HEIGHT)
-            .map_err(|_| GeometryProbeError::Ui4("frame-open"))?;
+        let frame = Frame::open_streaming(120, 96, WIDTH, HEIGHT)
+            .map_err(|error| GeometryProbeError::Ui4("frame-open", error))?;
         let device = Device::open(Capabilities::DEFAULT.union(Capabilities::PRESENT))
             .map_err(|code| GeometryProbeError::Vgpu("device-open", code))?;
         let queue = device
@@ -267,21 +293,28 @@ impl GeometryProbe {
         let mut retained_meshes = [None; ASSET_COUNT];
         for slot in 0..ASSET_COUNT {
             let asset = &ASSETS[slot];
+            let runtime_asset = &catalog.assets[slot];
+            if runtime_asset.vertices.len() != asset.vertices.len()
+                || runtime_asset.indices.len() != asset.indices.len()
+                || runtime_asset.base_color.len() != asset.base_color_bytes.len()
+            {
+                return Err(GeometryProbeError::Contract);
+            }
             let vertex_buffer = device
                 .create_buffer(
-                    asset.vertices.len(),
+                    runtime_asset.vertices.len(),
                     BUFFER_USAGE_MAP_WRITE | BUFFER_USAGE_VERTEX,
                 )
                 .map_err(|code| GeometryProbeError::Vgpu("asset-vertex-buffer-create", code))?;
             let index_buffer = device
                 .create_buffer(
-                    asset.indices.len(),
+                    runtime_asset.indices.len(),
                     BUFFER_USAGE_MAP_WRITE | BUFFER_USAGE_INDEX,
                 )
                 .map_err(|code| GeometryProbeError::Vgpu("asset-index-buffer-create", code))?;
-            write_exact(device, vertex_buffer, 0, asset.vertices)
+            write_exact(device, vertex_buffer, 0, &runtime_asset.vertices)
                 .map_err(|code| GeometryProbeError::Vgpu("asset-vertex-upload", code))?;
-            write_exact(device, index_buffer, 0, asset.indices)
+            write_exact(device, index_buffer, 0, &runtime_asset.indices)
                 .map_err(|code| GeometryProbeError::Vgpu("asset-index-upload", code))?;
             let retained_mesh = device
                 .create_retained_mesh(
@@ -305,20 +338,20 @@ impl GeometryProbe {
         }
         let line_vertex_buffer = device
             .create_buffer(
-                core::mem::size_of_val(&GRID_VERTICES),
+                catalog.line_vertices.len(),
                 BUFFER_USAGE_MAP_WRITE | BUFFER_USAGE_VERTEX,
             )
             .map_err(|code| GeometryProbeError::Vgpu("line-vertex-buffer-create", code))?;
         let line_index_buffer = device
             .create_buffer(
-                core::mem::size_of_val(&GRID_INDICES),
+                catalog.line_indices.len(),
                 BUFFER_USAGE_MAP_WRITE | BUFFER_USAGE_INDEX,
             )
             .map_err(|code| GeometryProbeError::Vgpu("line-index-buffer-create", code))?;
 
-        write_exact(device, line_vertex_buffer, 0, line_vertex_bytes())
+        write_exact(device, line_vertex_buffer, 0, &catalog.line_vertices)
             .map_err(|code| GeometryProbeError::Vgpu("line-vertex-upload", code))?;
-        write_exact(device, line_index_buffer, 0, line_index_bytes())
+        write_exact(device, line_index_buffer, 0, &catalog.line_indices)
             .map_err(|code| GeometryProbeError::Vgpu("line-index-upload", code))?;
 
         let mut probe = Self {
@@ -351,13 +384,14 @@ impl GeometryProbe {
             previous_elapsed_millis: 0,
         };
         for (slot, asset) in ASSETS.iter().enumerate() {
-            if asset.base_color_bytes.is_empty() {
+            let encoded = &catalog.assets[slot].base_color;
+            if encoded.is_empty() {
                 continue;
             }
             let texture = trueos::async_fs::block_on(trueos::vmedia::decode_retained_asset(
                 probe.device,
                 asset.base_color_name,
-                asset.base_color_bytes,
+                encoded,
             ));
             match texture {
                 Ok(texture) => {
@@ -367,7 +401,7 @@ impl GeometryProbe {
                         format_args!(
                             "PicassoExample: texture proof accepted=1 asset={} role=base-color encoded_bytes={} texture_id=0x{:X} decoded={}x{} stride={} residency={:?} kernel_rgba_readback=0",
                             asset.name,
-                            asset.base_color_bytes.len(),
+                            encoded.len(),
                             info.id.raw(),
                             info.width,
                             info.height,
@@ -383,7 +417,7 @@ impl GeometryProbe {
                         format_args!(
                             "PicassoExample: texture proof accepted=0 asset={} role=base-color encoded_bytes={} error={} action=abort-textured-scene-contract",
                             asset.name,
-                            asset.base_color_bytes.len(),
+                            encoded.len(),
                             code,
                         ),
                     );
@@ -403,7 +437,7 @@ impl GeometryProbe {
         self.previous_elapsed_millis = elapsed_millis;
         self.flycam
             .step_ui4(&self.frame, delta_seconds)
-            .map_err(|_| GeometryProbeError::Ui4("flycam-ui4"))?;
+            .map_err(|error| GeometryProbeError::Ui4("flycam-ui4", error))?;
         self.service_asset_hotkeys()?;
         self.service_frame_interaction()?;
         let width = self.frame.width();
@@ -411,7 +445,7 @@ impl GeometryProbe {
 
         self.frame
             .begin_gpu_frame()
-            .map_err(|_| GeometryProbeError::Ui4("frame-begin"))?;
+            .map_err(|error| GeometryProbeError::Ui4("frame-begin", error))?;
         let surface = self
             .device
             .acquire_ui4_surface(self.frame.window_id())
@@ -451,7 +485,7 @@ impl GeometryProbe {
             .map_err(|code| GeometryProbeError::Vgpu("timeline-wait", code))?;
         self.frame
             .publish(Damage::full(width, height))
-            .map_err(|_| GeometryProbeError::Ui4("frame-publish"))?;
+            .map_err(|error| GeometryProbeError::Ui4("frame-publish", error))?;
         self.timeline = point.value;
         Ok(())
     }
@@ -460,7 +494,7 @@ impl GeometryProbe {
         let state = self
             .frame
             .keyboard_state()
-            .map_err(|_| GeometryProbeError::Ui4("asset-hotkeys"))?;
+            .map_err(|error| GeometryProbeError::Ui4("asset-hotkeys", error))?;
         let current = state.map_or(0, |keyboard| {
             let mut bits = 0u8;
             for slot in 0..ASSET_COUNT {
@@ -504,7 +538,7 @@ impl GeometryProbe {
         while let Some(event) = self
             .frame
             .take_resize_event()
-            .map_err(|_| GeometryProbeError::Ui4("resize-event"))?
+            .map_err(|error| GeometryProbeError::Ui4("resize-event", error))?
         {
             requested_extent = Some((event.width, event.height));
         }
@@ -513,17 +547,17 @@ impl GeometryProbe {
         {
             self.frame
                 .resize(width, height)
-                .map_err(|_| GeometryProbeError::Ui4("maximize-resize"))?;
+                .map_err(|error| GeometryProbeError::Ui4("maximize-resize", error))?;
         }
 
         let (output_width, output_height) =
-            output_dimensions().map_err(|_| GeometryProbeError::Ui4("output-extent"))?;
+            output_dimensions().map_err(|error| GeometryProbeError::Ui4("output-extent", error))?;
         let mut drag = self.resize_drag;
         let mut live_extent = None;
         while let Some(event) = self
             .frame
             .take_pointer_event()
-            .map_err(|_| GeometryProbeError::Ui4("pointer-event"))?
+            .map_err(|error| GeometryProbeError::Ui4("pointer-event", error))?
         {
             let in_grip = event.local_x >= self.frame.width() as i32 - RESIZE_GRIP_PX
                 && event.local_y >= self.frame.height() as i32 - RESIZE_GRIP_PX
@@ -544,7 +578,7 @@ impl GeometryProbe {
                         CursorIcon::Default
                     },
                 )
-                .map_err(|_| GeometryProbeError::Ui4("resize-cursor"))?;
+                .map_err(|error| GeometryProbeError::Ui4("resize-cursor", error))?;
 
             if event.buttons_pressed & POINTER_BUTTON_PRIMARY != 0 && in_grip {
                 drag = Some(ResizeDrag {
@@ -580,7 +614,7 @@ impl GeometryProbe {
         {
             self.frame
                 .resize(width, height)
-                .map_err(|_| GeometryProbeError::Ui4("live-resize"))?;
+                .map_err(|error| GeometryProbeError::Ui4("live-resize", error))?;
         }
         Ok(())
     }
@@ -592,7 +626,7 @@ impl GeometryProbe {
     pub fn take_first_presentation(&mut self) -> Result<bool, GeometryProbeError> {
         self.frame
             .take_first_presentation()
-            .map_err(|_| GeometryProbeError::Ui4("first-presentation"))
+            .map_err(|error| GeometryProbeError::Ui4("first-presentation", error))
     }
 }
 
@@ -698,7 +732,7 @@ fn line_index_bytes() -> &'static [u8] {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GeometryProbeError {
     Contract,
-    Ui4(&'static str),
+    Ui4(&'static str, Ui4Error),
     Vgpu(&'static str, i32),
 }
 
@@ -809,7 +843,86 @@ impl VVideoVisibility<'_> {
     }
 }
 
+fn prepared_asset_key(asset: &str, object: &str) -> String {
+    format!("{asset}/prepared/{object}")
+}
+
+/// Publish the build-prepared representation into the same Picasso-owned
+/// runtime database as the exact source files. This is the packaging seam:
+/// build-time glTF parsing remains off the Blueprint, while every byte used by
+/// the renderer must cross Picasso's database read boundary first.
+fn put_prepared_assets(picasso: &Picasso) -> Result<(), trueos_picasso::PicassoError> {
+    for asset in &ASSETS {
+        picasso.put_embedded_asset(
+            &prepared_asset_key(asset.name, "mesh/vertices"),
+            asset.vertices,
+        )?;
+        picasso.put_embedded_asset(
+            &prepared_asset_key(asset.name, "mesh/indices"),
+            asset.indices,
+        )?;
+        picasso.put_embedded_asset(
+            &prepared_asset_key(asset.name, "material/base-color"),
+            asset.base_color_bytes,
+        )?;
+    }
+    picasso.put_embedded_asset("PicassoGrid/prepared/mesh/vertices", line_vertex_bytes())?;
+    picasso.put_embedded_asset("PicassoGrid/prepared/mesh/indices", line_index_bytes())?;
+    Ok(())
+}
+
+fn load_prepared_assets(
+    picasso: &Picasso,
+) -> Result<Option<DatabasePreparedCatalog>, trueos_picasso::PicassoError> {
+    let mut assets = Vec::with_capacity(ASSET_COUNT);
+    for asset in &ASSETS {
+        let Some(vertices) =
+            picasso.embedded_asset(&prepared_asset_key(asset.name, "mesh/vertices"))?
+        else {
+            return Ok(None);
+        };
+        let Some(indices) =
+            picasso.embedded_asset(&prepared_asset_key(asset.name, "mesh/indices"))?
+        else {
+            return Ok(None);
+        };
+        let Some(base_color) =
+            picasso.embedded_asset(&prepared_asset_key(asset.name, "material/base-color"))?
+        else {
+            return Ok(None);
+        };
+        assets.push(DatabasePreparedAsset {
+            vertices,
+            indices,
+            base_color,
+        });
+    }
+    let Some(line_vertices) = picasso.embedded_asset("PicassoGrid/prepared/mesh/vertices")? else {
+        return Ok(None);
+    };
+    let Some(line_indices) = picasso.embedded_asset("PicassoGrid/prepared/mesh/indices")? else {
+        return Ok(None);
+    };
+    Ok(Some(DatabasePreparedCatalog {
+        assets,
+        line_vertices,
+        line_indices,
+    }))
+}
+
 fn main() {
+    run();
+    if !trueos::vshell::shutdown_current_blueprint(
+        "PicassoExample terminated after a fatal scene error",
+    ) {
+        logl::log(
+            level::ERROR,
+            "PicassoExample: fatal scene return could not request Blueprint shutdown",
+        );
+    }
+}
+
+fn run() {
     // The example owns only the immutable source bytes. Picasso owns their
     // runtime representation behind this public asset-ingestion boundary.
     let picasso = match Picasso::new() {
@@ -835,18 +948,65 @@ fn main() {
             );
             return;
         }
+        match picasso.embedded_asset(asset.name) {
+            Ok(Some(stored)) if stored == asset.bytes => {}
+            Ok(_) => {
+                logl::log(
+                    level::ERROR,
+                    format_args!(
+                        "PicassoExample: embedded source round-trip mismatch asset={}",
+                        asset.name
+                    ),
+                );
+                return;
+            }
+            Err(error) => {
+                logl::log(
+                    level::ERROR,
+                    format_args!(
+                        "PicassoExample: embedded source read failed asset={} error={error:?}",
+                        asset.name
+                    ),
+                );
+                return;
+            }
+        }
         source_bytes += asset.bytes.len();
     }
+    if let Err(error) = put_prepared_assets(&picasso) {
+        logl::log(
+            level::ERROR,
+            format_args!("PicassoExample: prepared asset rejected error={error:?}"),
+        );
+        return;
+    }
+    let runtime_catalog = match load_prepared_assets(&picasso) {
+        Ok(Some(assets)) => assets,
+        Ok(None) => {
+            logl::log(
+                level::ERROR,
+                "PicassoExample: prepared asset missing after Picasso database publication",
+            );
+            return;
+        }
+        Err(error) => {
+            logl::log(
+                level::ERROR,
+                format_args!("PicassoExample: prepared asset read failed error={error:?}"),
+            );
+            return;
+        }
+    };
     logl::log(
         level::INFO,
         format_args!(
-            "PicassoExample: embedded assets accepted by Picasso assets={} exact_source_bytes={}",
+            "PicassoExample: database-backed assets ready assets={} exact_source_bytes={}",
             demodata::ASSETS.len(),
             source_bytes,
         ),
     );
 
-    let mut probe = match GeometryProbe::open() {
+    let mut probe = match GeometryProbe::open(&runtime_catalog) {
         Ok(probe) => probe,
         Err(error) => {
             logl::log(

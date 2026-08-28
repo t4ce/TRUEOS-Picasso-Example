@@ -15,7 +15,7 @@ bench = false
 
 [dependencies]
 libm = "0.2"
-trueos = { path = "../TRUEOS-Blueprints/api" }
+trueos = { path = "../TRUEOS-Blueprints/api", features = ["default-global-allocator", "default-panic-handler"] }
 trueos-picasso = { path = "../TRUEOS-Picasso", default-features = false, features = ["blueprint"] }
 
 [build-dependencies]
