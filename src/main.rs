@@ -160,25 +160,34 @@ pub struct HeadInstanceProgram {
     pub reserved: [u32; 2],
 }
 
-// With the fixed 60° off-axis camera, four 0.45-scale helmets at this spacing
-// remain inside the top clip boundary (including their local extent).
+// With the fixed upside-down presentation camera, this signed spacing makes
+// the helmet stack depart the origin along the displayed green axis.
 const HEAD_Y_SPACING: f32 = 1.6;
 const WORLD_AXIS_LENGTH: f32 = 2.0;
+const PRESENTATION_CAMERA_POSITION: [f32; 3] = [0.0, 0.0, -10.0];
+const PRESENTATION_CAMERA_TARGET: [f32; 3] = [0.0; 3];
+const PRESENTATION_CAMERA_WORLD_UP: [f32; 3] = [0.0, -1.0, 0.0];
 const HEAD_WORLD_TRANSLATIONS: [[f32; 3]; HEAD_INSTANCE_COUNT as usize] = [
     [0.0, 0.0, 0.0],
-    [0.0, HEAD_Y_SPACING, 0.0],
-    [0.0, HEAD_Y_SPACING * 2.0, 0.0],
-    [0.0, HEAD_Y_SPACING * 3.0, 0.0],
+    [0.0, -HEAD_Y_SPACING, 0.0],
+    [0.0, -HEAD_Y_SPACING * 2.0, 0.0],
+    [0.0, -HEAD_Y_SPACING * 3.0, 0.0],
 ];
 
 /// The presentation camera is deliberately fixed: all retained transforms and
 /// the static world-axis guide are authored against this same view.
 fn presentation_camera() -> Camera {
     Camera {
-        // Keep z=-10 as specified, with an X/Y offset so all three directed
-        // basis axes have a visible projected extent.
-        position: [3.0, 2.0, -10.0],
-        rotation: look_at_camera_rotation([3.0, 2.0, -10.0], [0.0; 3], [0.0, 1.0, 0.0]),
+        // Sit on the world-blue axis and keep the origin centred as the aim
+        // point. The negative Z placement gives the blue guide a forward
+        // direction through the scene.
+        position: PRESENTATION_CAMERA_POSITION,
+        // Preserve the aim point, but roll the complete view 180°.
+        rotation: look_at_camera_rotation(
+            PRESENTATION_CAMERA_POSITION,
+            PRESENTATION_CAMERA_TARGET,
+            PRESENTATION_CAMERA_WORLD_UP,
+        ),
         projection: Projection::Perspective {
             yfov: core::f32::consts::FRAC_PI_3,
             znear: 1.0,
@@ -263,19 +272,19 @@ pub const HEAD_INSTANCE_PROGRAMS: [HeadInstanceProgram; HEAD_INSTANCE_COUNT as u
         reserved: [0; 2],
     },
     HeadInstanceProgram {
-        initial: placed_head(HEAD_Y_SPACING),
+        initial: placed_head(-HEAD_Y_SPACING),
         angular_velocity_z: core::f32::consts::FRAC_PI_2,
         scale_half_period_seconds: 0.0,
         reserved: [0; 2],
     },
     HeadInstanceProgram {
-        initial: placed_head(HEAD_Y_SPACING * 2.0),
+        initial: placed_head(-HEAD_Y_SPACING * 2.0),
         angular_velocity_z: 0.0,
         scale_half_period_seconds: 0.5,
         reserved: [0; 2],
     },
     HeadInstanceProgram {
-        initial: placed_head(HEAD_Y_SPACING * 3.0),
+        initial: placed_head(-HEAD_Y_SPACING * 3.0),
         angular_velocity_z: 0.0,
         scale_half_period_seconds: 0.0,
         reserved: [0; 2],
@@ -1386,16 +1395,24 @@ mod tests {
     }
 
     #[test]
-    fn fixed_camera_projects_the_upward_helmet_stack_and_world_basis_axes() {
+    fn presentation_camera_stays_on_blue_axis_and_looks_at_origin() {
         let camera = presentation_camera();
-        assert_eq!(camera.position, [3.0, 2.0, -10.0]);
+        assert_eq!(camera.position, PRESENTATION_CAMERA_POSITION);
+        assert_eq!(camera.position[0], 0.0);
+        assert_eq!(camera.position[1], 0.0);
         let forward = camera.rotation.rotate([0.0, 0.0, -1.0]);
-        let expected_forward = [-3.0, -2.0, 10.0];
-        let expected_length = libm::sqrtf(113.0);
+        let expected_forward = [0.0, 0.0, 1.0];
         for axis in 0..3 {
-            assert!((forward[axis] - expected_forward[axis] / expected_length).abs() < 1.0e-5);
+            assert!((forward[axis] - expected_forward[axis]).abs() < 1.0e-5);
         }
-        assert!(camera.rotation.rotate([0.0, 1.0, 0.0])[1] > 0.0);
+        let distance_to_origin = [
+            PRESENTATION_CAMERA_TARGET[0] - camera.position[0],
+            PRESENTATION_CAMERA_TARGET[1] - camera.position[1],
+            PRESENTATION_CAMERA_TARGET[2] - camera.position[2],
+        ];
+        assert!(distance_to_origin[0] == 0.0 && distance_to_origin[1] == 0.0);
+        assert!(distance_to_origin[2] > 0.0);
+        assert!(camera.rotation.rotate([0.0, 1.0, 0.0])[1] < 0.0);
         assert_eq!(
             camera.projection,
             Projection::Perspective {
@@ -1432,11 +1449,11 @@ mod tests {
         let z_end = point(5);
         assert_eq!(origin, y_origin);
         assert_eq!(origin, z_origin);
-        // World +Y projects upward on the top-left-origin retained surface.
-        // The off-axis camera also gives world +Z a
-        // real screen-space segment instead of a depth-only point at origin.
+        // The upside-down camera makes world +Y project downward on the
+        // top-left-origin retained surface. Looking along +Z makes the blue
+        // axis depth-only at its origin, while X remains visibly horizontal.
         assert_ne!(x_end, origin);
-        assert!(y_end[1] < origin[1]);
-        assert!(z_end[0] != origin[0] || z_end[1] != origin[1]);
+        assert!(y_end[1] > origin[1]);
+        assert_eq!(z_end, origin);
     }
 }
