@@ -551,11 +551,7 @@ impl GeometryProbe {
                     &runtime_material.normal,
                 )?,
             };
-            if asset.sampled_material
-                && (material.base_color.is_none()
-                    || material.emissive.is_none()
-                    || asset.material.emissive_factor != [1.0; 3])
-            {
+            if asset.sampled_material && material.base_color.is_none() {
                 return Err(GeometryProbeError::Contract);
             }
             probe.material_textures[slot] = material;
@@ -607,11 +603,9 @@ impl GeometryProbe {
                             &self.material_textures[self.selected_asset],
                             ASSETS[self.selected_asset].sampled_material,
                         ),
-                        emissive_factor: if ASSETS[self.selected_asset].sampled_material {
-                            ASSETS[self.selected_asset].material.emissive_factor
-                        } else {
-                            [0.0; 3]
-                        },
+                        // The base-color-only rung has no factor uniform.
+                        // Keep the ABI's reserved emissive factor at zero.
+                        emissive_factor: [0.0; 3],
                         ..RetainedMaterial::default()
                     },
                     clear_rgba8_srgb: u32::from_le_bytes([0, 128, 0, 0]),
@@ -1058,22 +1052,12 @@ fn retained_material_texture_ids(material: &ResidentMaterial, sampled: bool) -> 
             .base_color
             .as_ref()
             .map_or(0, |texture| texture.id().raw()),
-        material
-            .metallic_roughness
-            .as_ref()
-            .map_or(0, |texture| texture.id().raw()),
-        material
-            .emissive
-            .as_ref()
-            .map_or(0, |texture| texture.id().raw()),
-        material
-            .occlusion
-            .as_ref()
-            .map_or(0, |texture| texture.id().raw()),
-        material
-            .normal
-            .as_ref()
-            .map_or(0, |texture| texture.id().raw()),
+        // The other decoded bundle members remain unbound until their shader
+        // consumers exist. This rung isolates base color only.
+        0,
+        0,
+        0,
+        0,
     ]
 }
 
@@ -1533,9 +1517,7 @@ mod tests {
         for asset in ASSETS {
             assert_eq!(
                 asset.sampled_material,
-                !asset.material.base_color.bytes.is_empty()
-                    && !asset.material.emissive.bytes.is_empty()
-                    && asset.material.emissive_factor == [1.0; 3]
+                ENABLE_SAMPLED_MATERIAL && !asset.material.base_color.bytes.is_empty()
             );
             assert_eq!(
                 asset.vertex_stride,

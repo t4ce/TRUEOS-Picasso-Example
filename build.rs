@@ -13,10 +13,10 @@ const ASSETS: [(&str, &str); 5] = [
     ("RiggedSimple", "Assets/RiggedSimple/RiggedSimple.glb"),
 ];
 
-// The retained material owns every source map as one atomically admitted
-// bundle. The shader consumes them in rungs, starting with base-color plus
-// emissive, but residency is not negotiated map by map.
-const ENABLE_SAMPLED_MATERIAL: bool = true;
+// Stable presentation baseline: retain every map for startup admission, but
+// route the active draw through the known opaque position+normal path. The
+// base-color-only shader remains baked for the next isolated texture probe.
+const ENABLE_SAMPLED_MATERIAL: bool = false;
 
 fn main() {
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set"));
@@ -101,13 +101,7 @@ fn main() {
         let retained_double_sided = prepared_primitives
             .iter()
             .any(|primitive| primitive.double_sided);
-        let sampled_material = ENABLE_SAMPLED_MATERIAL
-            && material.base_color.is_some()
-            && material.emissive.is_some()
-            // The first PS rung adds sampled emissive directly. Preserve
-            // non-unit glTF factors for the later uniform-backed rung rather
-            // than presenting them with an incorrect brightness.
-            && material.emissive_factor == [1.0; 3];
+        let sampled_material = ENABLE_SAMPLED_MATERIAL && material.base_color.is_some();
         catalog.push_str(&format!(
             "PreparedAsset {{ name: \"{name}\", vertices: include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{vertex_file}\")), indices: include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{index_file}\")), vertex_count: {vertex_count}, index_count: {index_count}, vertex_stride: {vertex_stride}, material: PreparedMaterial {{ base_color: {base_color}, metallic_roughness: {metallic_roughness}, emissive: {emissive}, occlusion: {occlusion}, normal: {normal}, emissive_factor: {emissive_factor:?} }}, sampled_material: {sampled_material}, helmet_program: {helmet_program}, primitives: &[{primitives}], retained_topology: {retained_topology}, retained_double_sided: {retained_double_sided} }},\n",
             vertex_count = vertices.len() / vertex_stride,
@@ -202,13 +196,9 @@ fn prepare(source: &Path, sampled_material: bool) -> PreparedGeometry {
             .as_ref()
             .map_or([0.0; 3], |material| material.emissive_factor()),
     };
-    // The active first retained PS is exactly `base + emissive`, so arm it
-    // only when both maps exist and the glTF emissive multiplier is identity.
-    // Every supplied map is still emitted for atomically bundled residency.
-    let sampled_material = sampled_material
-        && prepared_material.base_color.is_some()
-        && prepared_material.emissive.is_some()
-        && prepared_material.emissive_factor == [1.0; 3];
+    // The active retained shader samples base color alone while every supplied
+    // map is still emitted for atomically bundled residency.
+    let sampled_material = sampled_material && prepared_material.base_color.is_some();
     let (mut positions, mut normals, mut uvs, mut indices) = (
         Vec::<[f32; 3]>::new(),
         Vec::<[f32; 3]>::new(),
