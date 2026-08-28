@@ -160,9 +160,90 @@ pub struct HeadInstanceProgram {
     pub reserved: [u32; 2],
 }
 
-const fn placed_head(x: f32, y: f32) -> TransformValue {
+// With the fixed 60° off-axis camera, four 0.45-scale helmets at this spacing
+// remain inside the top clip boundary (including their local extent).
+const HEAD_Y_SPACING: f32 = 1.6;
+const WORLD_AXIS_LENGTH: f32 = 2.0;
+const HEAD_WORLD_TRANSLATIONS: [[f32; 3]; HEAD_INSTANCE_COUNT as usize] = [
+    [0.0, 0.0, 0.0],
+    [0.0, HEAD_Y_SPACING, 0.0],
+    [0.0, HEAD_Y_SPACING * 2.0, 0.0],
+    [0.0, HEAD_Y_SPACING * 3.0, 0.0],
+];
+
+/// The presentation camera is deliberately fixed: all retained transforms and
+/// the static world-axis guide are authored against this same view.
+fn presentation_camera() -> Camera {
+    Camera {
+        // Keep z=-10 as specified, with an X/Y offset so all three directed
+        // basis axes have a visible projected extent.
+        position: [3.0, 2.0, -10.0],
+        rotation: look_at_camera_rotation([3.0, 2.0, -10.0], [0.0; 3], [0.0, 1.0, 0.0]),
+        projection: Projection::Perspective {
+            yfov: core::f32::consts::FRAC_PI_3,
+            znear: 1.0,
+            zfar: Some(100.0),
+            aspect_ratio: None,
+        },
+    }
+}
+
+/// Return the camera-to-world rotation whose local -Z axis targets `target`
+/// and whose local +Y axis is the world-up closest valid basis direction.
+fn look_at_camera_rotation(position: [f32; 3], target: [f32; 3], world_up: [f32; 3]) -> Quaternion {
+    let forward = [
+        target[0] - position[0],
+        target[1] - position[1],
+        target[2] - position[2],
+    ];
+    let forward_length =
+        libm::sqrtf(forward[0] * forward[0] + forward[1] * forward[1] + forward[2] * forward[2]);
+    let forward = [
+        forward[0] / forward_length,
+        forward[1] / forward_length,
+        forward[2] / forward_length,
+    ];
+    // Local +X is camera right; local +Y completes the orthonormal frame.
+    let right = [
+        forward[1] * world_up[2] - forward[2] * world_up[1],
+        forward[2] * world_up[0] - forward[0] * world_up[2],
+        forward[0] * world_up[1] - forward[1] * world_up[0],
+    ];
+    let right_length = libm::sqrtf(right[0] * right[0] + right[1] * right[1] + right[2] * right[2]);
+    let right = [
+        right[0] / right_length,
+        right[1] / right_length,
+        right[2] / right_length,
+    ];
+    let up = [
+        right[1] * forward[2] - right[2] * forward[1],
+        right[2] * forward[0] - right[0] * forward[2],
+        right[0] * forward[1] - right[1] * forward[0],
+    ];
+    // Matrix columns map local +X, +Y, +Z to world right, up, and -forward.
+    let (m00, m01, m02) = (right[0], up[0], -forward[0]);
+    let (m10, m11, m12) = (right[1], up[1], -forward[1]);
+    let (m20, m21, m22) = (right[2], up[2], -forward[2]);
+    let trace = m00 + m11 + m22;
+    let rotation = if trace > 0.0 {
+        let s = libm::sqrtf(trace + 1.0) * 2.0;
+        Quaternion([(m21 - m12) / s, (m02 - m20) / s, (m10 - m01) / s, 0.25 * s])
+    } else if m00 > m11 && m00 > m22 {
+        let s = libm::sqrtf(1.0 + m00 - m11 - m22) * 2.0;
+        Quaternion([0.25 * s, (m01 + m10) / s, (m02 + m20) / s, (m21 - m12) / s])
+    } else if m11 > m22 {
+        let s = libm::sqrtf(1.0 + m11 - m00 - m22) * 2.0;
+        Quaternion([(m01 + m10) / s, 0.25 * s, (m12 + m21) / s, (m02 - m20) / s])
+    } else {
+        let s = libm::sqrtf(1.0 + m22 - m00 - m11) * 2.0;
+        Quaternion([(m02 + m20) / s, (m12 + m21) / s, 0.25 * s, (m10 - m01) / s])
+    };
+    rotation.normalized()
+}
+
+const fn placed_head(y: f32) -> TransformValue {
     TransformValue {
-        translation: [x, y, 0.0],
+        translation: [0.0, y, 0.0],
         translation_pad: 0.0,
         rotation: [0.0, 0.0, 0.0, 1.0],
         scale: [0.45, 0.45, 0.45],
@@ -176,25 +257,25 @@ const fn placed_head(x: f32, y: f32) -> TransformValue {
 /// clockwise, counter-clockwise, 0.5-second collapse/expand, and identity.
 pub const HEAD_INSTANCE_PROGRAMS: [HeadInstanceProgram; HEAD_INSTANCE_COUNT as usize] = [
     HeadInstanceProgram {
-        initial: placed_head(-0.5, 0.5),
+        initial: placed_head(0.0),
         angular_velocity_z: -core::f32::consts::FRAC_PI_2,
         scale_half_period_seconds: 0.0,
         reserved: [0; 2],
     },
     HeadInstanceProgram {
-        initial: placed_head(0.5, 0.5),
+        initial: placed_head(HEAD_Y_SPACING),
         angular_velocity_z: core::f32::consts::FRAC_PI_2,
         scale_half_period_seconds: 0.0,
         reserved: [0; 2],
     },
     HeadInstanceProgram {
-        initial: placed_head(-0.5, -0.5),
+        initial: placed_head(HEAD_Y_SPACING * 2.0),
         angular_velocity_z: 0.0,
         scale_half_period_seconds: 0.5,
         reserved: [0; 2],
     },
     HeadInstanceProgram {
-        initial: placed_head(0.5, -0.5),
+        initial: placed_head(HEAD_Y_SPACING * 3.0),
         angular_velocity_z: 0.0,
         scale_half_period_seconds: 0.0,
         reserved: [0; 2],
@@ -349,7 +430,14 @@ impl GeometryProbe {
             )
             .map_err(|code| GeometryProbeError::Vgpu("line-index-buffer-create", code))?;
 
-        write_exact(device, line_vertex_buffer, 0, &catalog.line_vertices)
+        // Static draws do not inherit the retained carrier's transform seed.
+        // Preserve the Picasso DB's world-space source, then project its six
+        // axis vertices once for this deliberately fixed presentation camera.
+        let camera = presentation_camera();
+        let projected_line_vertices =
+            project_static_line_vertices(&catalog.line_vertices, camera, WIDTH, HEIGHT)
+                .ok_or(GeometryProbeError::Contract)?;
+        write_exact(device, line_vertex_buffer, 0, &projected_line_vertices)
             .map_err(|code| GeometryProbeError::Vgpu("line-vertex-upload", code))?;
         write_exact(device, line_index_buffer, 0, &catalog.line_indices)
             .map_err(|code| GeometryProbeError::Vgpu("line-index-upload", code))?;
@@ -366,23 +454,14 @@ impl GeometryProbe {
             retained_meshes,
             selected_asset: 0,
             number_keys: 0,
-            flycam: FlyCam::new(
-                Camera {
-                    position: [0.0; 3],
-                    rotation: Quaternion::IDENTITY,
-                    projection: Projection::Perspective {
-                        yfov: core::f32::consts::FRAC_PI_3,
-                        znear: 0.01,
-                        zfar: Some(100.0),
-                        aspect_ratio: None,
-                    },
-                },
-                0.75,
-            ),
+            flycam: FlyCam::new(camera, 0.0),
             resize_drag: None,
             timeline: 0,
             previous_elapsed_millis: 0,
         };
+        // Static axis vertices were projected above.  Do not let UI4 input
+        // silently move the retained scene away from that shared camera.
+        probe.flycam.set_look_sensitivity(0.0);
         for (slot, asset) in ASSETS.iter().enumerate() {
             let encoded = &catalog.assets[slot].base_color;
             if encoded.is_empty() {
@@ -474,6 +553,8 @@ impl GeometryProbe {
                         elapsed_millis,
                         self.flycam.camera,
                         ASSETS[self.selected_asset].helmet_program,
+                        width,
+                        height,
                     ),
                     static_draws: retained_line_draws(),
                     ..RetainedFrameSubmit::default()
@@ -647,6 +728,8 @@ fn retained_seeds(
     elapsed_millis: u64,
     camera: Camera,
     helmet_program: bool,
+    viewport_width: u32,
+    viewport_height: u32,
 ) -> [RetainedTransformSeed; trueos::vgpu::MAX_RETAINED_TRANSFORM_SEEDS] {
     let seconds = elapsed_millis as f32 * 0.001;
     let half_angle = core::f32::consts::FRAC_PI_4 * seconds;
@@ -654,12 +737,6 @@ fn retained_seeds(
     let counter_clockwise = [0.0, 0.0, libm::sinf(half_angle), libm::cosf(half_angle)];
     let half_cycle = (elapsed_millis % 1_000) as f32;
     let pulse = libm::fabsf(half_cycle - 500.0) / 500.0;
-    let translations = [
-        [-0.5, 0.5, 0.0],
-        [0.5, 0.5, 0.0],
-        [-0.5, -0.5, 0.0],
-        [0.5, -0.5, 0.0],
-    ];
     let [qx, qy, qz, qw] = camera.rotation.normalized().0;
     let view_rotation = Quaternion([-qx, -qy, -qz, qw]);
     let mut seeds = [RetainedTransformSeed::default(); trueos::vgpu::MAX_RETAINED_TRANSFORM_SEEDS];
@@ -669,7 +746,7 @@ fn retained_seeds(
         .enumerate()
     {
         let world_translation = if helmet_program {
-            translations[slot]
+            HEAD_WORLD_TRANSLATIONS[slot]
         } else {
             [0.0; 3]
         };
@@ -684,15 +761,23 @@ fn retained_seeds(
             1 => counter_clockwise,
             _ => [0.0, 0.0, 0.0, 1.0],
         };
+        let world_scale = if !helmet_program {
+            1.0
+        } else if slot == 2 {
+            0.45 * pulse
+        } else {
+            0.45
+        };
+        let (projected_translation, projected_scale) = project_camera_transform(
+            camera.projection,
+            viewport_width,
+            viewport_height,
+            view_translation,
+            world_scale,
+        );
         *seed = RetainedTransformSeed {
-            translation: view_translation,
-            scale: if !helmet_program {
-                [1.0; 3]
-            } else if slot == 2 {
-                [0.45 * pulse; 3]
-            } else {
-                [0.45; 3]
-            },
+            translation: projected_translation,
+            scale: projected_scale,
             rotation: (view_rotation * Quaternion(world_rotation)).normalized().0,
             local_radius: 1.0,
             previous_translation: view_translation,
@@ -701,6 +786,124 @@ fn retained_seeds(
         };
     }
     seeds
+}
+
+/// Picasso's retained carrier currently owns an identity camera matrix. Fold
+/// the runtime camera into each compact model seed so geometry remains GPU
+/// transformed without a second vertex upload. All current demo objects share
+/// one Z plane, making this center-depth perspective representation exact for
+/// placement and stable for the small normalized meshes.
+fn project_camera_transform(
+    projection: Projection,
+    viewport_width: u32,
+    viewport_height: u32,
+    view_translation: [f32; 3],
+    world_scale: f32,
+) -> ([f32; 3], [f32; 3]) {
+    match projection {
+        Projection::Perspective {
+            yfov,
+            znear,
+            zfar,
+            aspect_ratio,
+        } => {
+            let aspect = aspect_ratio
+                .unwrap_or_else(|| viewport_width as f32 / viewport_height.max(1) as f32);
+            let depth = (-view_translation[2]).max(znear);
+            let focal_y = 1.0 / libm::tanf(yfov * 0.5);
+            let focal_x = focal_y / aspect;
+            let (ndc_z, depth_scale) = match zfar {
+                Some(far) => {
+                    let range = (far - znear).max(f32::EPSILON);
+                    (
+                        far / range - far * znear / (range * depth),
+                        far * znear / (range * depth * depth),
+                    )
+                }
+                None => (1.0 - znear / depth, znear / (depth * depth)),
+            };
+            (
+                [
+                    view_translation[0] * focal_x / depth,
+                    // The retained presentation surface uses a top-left
+                    // screen-space Y convention after this folded projection.
+                    // Negate camera-up here so world +Y rises on screen.
+                    -view_translation[1] * focal_y / depth,
+                    ndc_z,
+                ],
+                [
+                    world_scale * focal_x / depth,
+                    world_scale * focal_y / depth,
+                    world_scale * depth_scale,
+                ],
+            )
+        }
+        Projection::Orthographic {
+            xmag,
+            ymag,
+            znear,
+            zfar,
+        } => {
+            let depth = -view_translation[2];
+            let range = (zfar - znear).max(f32::EPSILON);
+            (
+                [
+                    view_translation[0] / xmag,
+                    view_translation[1] / ymag,
+                    (depth - znear) / range,
+                ],
+                [world_scale / xmag, world_scale / ymag, world_scale / range],
+            )
+        }
+    }
+}
+
+/// Convert Picasso's database-owned float3 world vertices into the clip-space
+/// vertex ABI consumed by retained static draws.  Unlike the retained helmet,
+/// that static path has no transform seed of its own.
+fn project_static_line_vertices(
+    world_vertex_bytes: &[u8],
+    camera: Camera,
+    viewport_width: u32,
+    viewport_height: u32,
+) -> Option<Vec<u8>> {
+    if world_vertex_bytes.len() != core::mem::size_of_val(&GRID_VERTICES)
+        || !world_vertex_bytes.len().is_multiple_of(12)
+    {
+        return None;
+    }
+    let [qx, qy, qz, qw] = camera.rotation.normalized().0;
+    let view_rotation = Quaternion([-qx, -qy, -qz, qw]);
+    let mut projected = Vec::with_capacity(world_vertex_bytes.len());
+    for bytes in world_vertex_bytes.chunks_exact(12) {
+        let world = [
+            f32::from_le_bytes(bytes[0..4].try_into().ok()?),
+            f32::from_le_bytes(bytes[4..8].try_into().ok()?),
+            f32::from_le_bytes(bytes[8..12].try_into().ok()?),
+        ];
+        if world.iter().any(|component| !component.is_finite()) {
+            return None;
+        }
+        let view = view_rotation.rotate([
+            world[0] * WORLD_AXIS_LENGTH - camera.position[0],
+            world[1] * WORLD_AXIS_LENGTH - camera.position[1],
+            world[2] * WORLD_AXIS_LENGTH - camera.position[2],
+        ]);
+        let (clip, _) = project_camera_transform(
+            camera.projection,
+            viewport_width,
+            viewport_height,
+            view,
+            1.0,
+        );
+        if clip.iter().any(|component| !component.is_finite()) {
+            return None;
+        }
+        for component in clip {
+            projected.extend_from_slice(&component.to_le_bytes());
+        }
+    }
+    Some(projected)
 }
 
 const fn retained_seed_count(helmet_program: bool) -> u32 {
@@ -1170,5 +1373,70 @@ mod tests {
             assert_eq!(draw.rgba8_srgb, u32::from_le_bytes(expected_rgba));
         }
         assert_eq!(GRID_INDICES, [0, 1, 0, 1, 0, 1]);
+        let draws = retained_line_draws();
+        for (slot, expected_rgba) in [[255, 32, 32, 255], [32, 255, 32, 255], [32, 96, 255, 255]]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(draws[slot].first_index, slot as u32 * 2);
+            assert_eq!(draws[slot].base_vertex, slot as i32 * 2);
+            assert_eq!(draws[slot].index_count, 2);
+            assert_eq!(draws[slot].rgba8_srgb, u32::from_le_bytes(expected_rgba));
+        }
+    }
+
+    #[test]
+    fn fixed_camera_projects_the_upward_helmet_stack_and_world_basis_axes() {
+        let camera = presentation_camera();
+        assert_eq!(camera.position, [3.0, 2.0, -10.0]);
+        let forward = camera.rotation.rotate([0.0, 0.0, -1.0]);
+        let expected_forward = [-3.0, -2.0, 10.0];
+        let expected_length = libm::sqrtf(113.0);
+        for axis in 0..3 {
+            assert!((forward[axis] - expected_forward[axis] / expected_length).abs() < 1.0e-5);
+        }
+        assert!(camera.rotation.rotate([0.0, 1.0, 0.0])[1] > 0.0);
+        assert_eq!(
+            camera.projection,
+            Projection::Perspective {
+                yfov: core::f32::consts::FRAC_PI_3,
+                znear: 1.0,
+                zfar: Some(100.0),
+                aspect_ratio: None,
+            }
+        );
+
+        let seeds = retained_seeds(0, camera, true, 640, 360);
+        for slot in 1..HEAD_INSTANCE_COUNT as usize {
+            assert!(seeds[slot].translation[1] < seeds[slot - 1].translation[1]);
+        }
+        assert!(
+            seeds[HEAD_INSTANCE_COUNT as usize - 1].translation[1]
+                + seeds[HEAD_INSTANCE_COUNT as usize - 1].scale[1]
+                < 1.0
+        );
+
+        let projected = project_static_line_vertices(line_vertex_bytes(), camera, 640, 360)
+            .expect("the six finite Picasso grid vertices project");
+        let point = |index: usize| -> [f32; 3] {
+            core::array::from_fn(|axis| {
+                let offset = index * 12 + axis * 4;
+                f32::from_le_bytes(projected[offset..offset + 4].try_into().unwrap())
+            })
+        };
+        let origin = point(0);
+        let x_end = point(1);
+        let y_origin = point(2);
+        let y_end = point(3);
+        let z_origin = point(4);
+        let z_end = point(5);
+        assert_eq!(origin, y_origin);
+        assert_eq!(origin, z_origin);
+        // World +Y projects upward on the top-left-origin retained surface.
+        // The off-axis camera also gives world +Z a
+        // real screen-space segment instead of a depth-only point at origin.
+        assert_ne!(x_end, origin);
+        assert!(y_end[1] < origin[1]);
+        assert!(z_end[0] != origin[0] || z_end[1] != origin[1]);
     }
 }
