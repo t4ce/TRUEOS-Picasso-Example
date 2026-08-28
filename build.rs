@@ -13,10 +13,10 @@ const ASSETS: [(&str, &str); 5] = [
     ("RiggedSimple", "Assets/RiggedSimple/RiggedSimple.glb"),
 ];
 
-// Keep source textures prepared in Picasso's database, but have this demo use
-// the established opaque POS+normal retained path until its sampled-material
-// presentation is re-enabled.
-const ENABLE_SAMPLED_MATERIAL: bool = false;
+// The retained material owns every source map as one atomically admitted
+// bundle. The shader consumes them in rungs, starting with base-color plus
+// emissive, but residency is not negotiated map by map.
+const ENABLE_SAMPLED_MATERIAL: bool = true;
 
 fn main() {
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set"));
@@ -29,7 +29,7 @@ fn main() {
         let PreparedGeometry {
             vertices,
             indices,
-            base_color,
+            material,
             vertex_stride,
             primitives: prepared_primitives,
         } = prepare(source_path, ENABLE_SAMPLED_MATERIAL);
@@ -38,16 +38,41 @@ fn main() {
         let index_file = format!("{stem}.indices.u32le");
         fs::write(out.join(&vertex_file), &vertices).expect("write vertices");
         fs::write(out.join(&index_file), &indices).expect("write indices");
-        let (base_color_name, base_color_bytes) = if let Some((extension, bytes)) = base_color {
-            let file = format!("{stem}.basecolor.{extension}");
-            fs::write(out.join(&file), bytes).expect("write base-color texture");
-            (
-                format!("{name}.basecolor.{extension}"),
-                format!("include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{file}\"))"),
-            )
-        } else {
-            (String::new(), String::from("&[]"))
-        };
+        let base_color = write_texture(
+            out.as_path(),
+            &stem,
+            name,
+            "base-color",
+            material.base_color.as_ref(),
+        );
+        let metallic_roughness = write_texture(
+            out.as_path(),
+            &stem,
+            name,
+            "metallic-roughness",
+            material.metallic_roughness.as_ref(),
+        );
+        let emissive = write_texture(
+            out.as_path(),
+            &stem,
+            name,
+            "emissive",
+            material.emissive.as_ref(),
+        );
+        let occlusion = write_texture(
+            out.as_path(),
+            &stem,
+            name,
+            "occlusion",
+            material.occlusion.as_ref(),
+        );
+        let normal = write_texture(
+            out.as_path(),
+            &stem,
+            name,
+            "normal",
+            material.normal.as_ref(),
+        );
         let primitives = prepared_primitives
             .iter()
             .map(|primitive| format!(
@@ -76,7 +101,21 @@ fn main() {
         let retained_double_sided = prepared_primitives
             .iter()
             .any(|primitive| primitive.double_sided);
-        catalog.push_str(&format!("PreparedAsset {{ name: \"{name}\", vertices: include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{vertex_file}\")), indices: include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{index_file}\")), vertex_count: {}, index_count: {}, vertex_stride: {vertex_stride}, base_color_name: \"{base_color_name}\", base_color_bytes: {base_color_bytes}, sampled_material: {}, helmet_program: {}, primitives: &[{primitives}], retained_topology: {retained_topology}, retained_double_sided: {retained_double_sided} }},\n", vertices.len()/vertex_stride, indices.len()/4, ENABLE_SAMPLED_MATERIAL && !base_color_name.is_empty(), slot==0));
+        let sampled_material = ENABLE_SAMPLED_MATERIAL
+            && material.base_color.is_some()
+            && material.emissive.is_some()
+            // The first PS rung adds sampled emissive directly. Preserve
+            // non-unit glTF factors for the later uniform-backed rung rather
+            // than presenting them with an incorrect brightness.
+            && material.emissive_factor == [1.0; 3];
+        catalog.push_str(&format!(
+            "PreparedAsset {{ name: \"{name}\", vertices: include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{vertex_file}\")), indices: include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{index_file}\")), vertex_count: {vertex_count}, index_count: {index_count}, vertex_stride: {vertex_stride}, material: PreparedMaterial {{ base_color: {base_color}, metallic_roughness: {metallic_roughness}, emissive: {emissive}, occlusion: {occlusion}, normal: {normal}, emissive_factor: {emissive_factor:?} }}, sampled_material: {sampled_material}, helmet_program: {helmet_program}, primitives: &[{primitives}], retained_topology: {retained_topology}, retained_double_sided: {retained_double_sided} }},\n",
+            vertex_count = vertices.len() / vertex_stride,
+            index_count = indices.len() / 4,
+            emissive_factor = material.emissive_factor,
+            sampled_material = sampled_material,
+            helmet_program = slot == 0,
+        ));
     }
     catalog.push_str("];\n");
     fs::write(out.join("prepared_assets.rs"), catalog).expect("write asset catalog");
@@ -85,9 +124,18 @@ fn main() {
 struct PreparedGeometry {
     vertices: Vec<u8>,
     indices: Vec<u8>,
-    base_color: Option<(&'static str, Vec<u8>)>,
+    material: PreparedMaterial,
     vertex_stride: usize,
     primitives: Vec<PreparedPrimitive>,
+}
+
+struct PreparedMaterial {
+    base_color: Option<(&'static str, Vec<u8>)>,
+    metallic_roughness: Option<(&'static str, Vec<u8>)>,
+    emissive: Option<(&'static str, Vec<u8>)>,
+    occlusion: Option<(&'static str, Vec<u8>)>,
+    normal: Option<(&'static str, Vec<u8>)>,
+    emissive_factor: [f32; 3],
 }
 
 struct PreparedPrimitive {
@@ -115,16 +163,52 @@ fn prepare(source: &Path, sampled_material: bool) -> PreparedGeometry {
             gltf::buffer::Source::Uri(uri) => fs::read(base.join(uri)).expect("external buffer"),
         })
         .collect();
-    let base_color = parsed
-        .materials()
-        .find_map(|material| {
+    let material = parsed.materials().next();
+    let texture = |source: Option<gltf::image::Source<'_>>| {
+        source.and_then(|image| load_supported_image(image, &buffers, base))
+    };
+    let prepared_material = PreparedMaterial {
+        base_color: texture(material.as_ref().and_then(|material| {
             material
                 .pbr_metallic_roughness()
                 .base_color_texture()
                 .map(|info| info.texture().source().source())
-        })
-        .and_then(|image| load_supported_image(image, &buffers, base));
-    let sampled_material = sampled_material && base_color.is_some();
+        })),
+        metallic_roughness: texture(material.as_ref().and_then(|material| {
+            material
+                .pbr_metallic_roughness()
+                .metallic_roughness_texture()
+                .map(|info| info.texture().source().source())
+        })),
+        emissive: texture(
+            material
+                .as_ref()
+                .and_then(|material| material.emissive_texture())
+                .map(|info| info.texture().source().source()),
+        ),
+        occlusion: texture(
+            material
+                .as_ref()
+                .and_then(|material| material.occlusion_texture())
+                .map(|info| info.texture().source().source()),
+        ),
+        normal: texture(
+            material
+                .as_ref()
+                .and_then(|material| material.normal_texture())
+                .map(|info| info.texture().source().source()),
+        ),
+        emissive_factor: material
+            .as_ref()
+            .map_or([0.0; 3], |material| material.emissive_factor()),
+    };
+    // The active first retained PS is exactly `base + emissive`, so arm it
+    // only when both maps exist and the glTF emissive multiplier is identity.
+    // Every supplied map is still emitted for atomically bundled residency.
+    let sampled_material = sampled_material
+        && prepared_material.base_color.is_some()
+        && prepared_material.emissive.is_some()
+        && prepared_material.emissive_factor == [1.0; 3];
     let (mut positions, mut normals, mut uvs, mut indices) = (
         Vec::<[f32; 3]>::new(),
         Vec::<[f32; 3]>::new(),
@@ -189,10 +273,27 @@ fn prepare(source: &Path, sampled_material: bool) -> PreparedGeometry {
     PreparedGeometry {
         vertices: vb,
         indices: ib,
-        base_color,
+        material: prepared_material,
         vertex_stride,
         primitives,
     }
+}
+
+fn write_texture(
+    out: &Path,
+    stem: &str,
+    asset_name: &str,
+    role: &str,
+    texture: Option<&(&'static str, Vec<u8>)>,
+) -> String {
+    let Some((extension, bytes)) = texture else {
+        return String::from("PreparedTexture::NONE");
+    };
+    let file = format!("{stem}.{role}.{extension}");
+    fs::write(out.join(&file), bytes).expect("write prepared material texture");
+    format!(
+        "PreparedTexture {{ name: \"{asset_name}.{role}.{extension}\", bytes: include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{file}\")) }}"
+    )
 }
 
 fn primitive_topology(mode: gltf::mesh::Mode) -> &'static str {

@@ -19,7 +19,8 @@ use trueos::vgpu::{
     PRIMITIVE_TOPOLOGY_LINE_STRIP, PRIMITIVE_TOPOLOGY_POINT_LIST, PRIMITIVE_TOPOLOGY_TRIANGLE_FAN,
     PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, Queue, QueueClass,
     RETAINED_VERTEX_LAYOUT_POS_NORMAL, RETAINED_VERTEX_LAYOUT_POS_NORMAL_UV, RetainedCamera,
-    RetainedFrameSubmit, RetainedMesh, RetainedMeshDescriptor, RetainedTransformSeed, VVideoMem,
+    RetainedFrameSubmit, RetainedMaterial, RetainedMesh, RetainedMeshDescriptor,
+    RetainedTransformSeed, VVideoMem,
 };
 use trueos::{
     clock,
@@ -42,8 +43,9 @@ pub struct PreparedAsset {
     pub vertex_count: u32,
     pub index_count: u32,
     pub vertex_stride: usize,
-    pub base_color_name: &'static str,
-    pub base_color_bytes: &'static [u8],
+    /// Every image and scalar required by one glTF material. Images remain
+    /// encoded until the owner-scoped retained-material admission at startup.
+    pub material: PreparedMaterial,
     pub sampled_material: bool,
     pub helmet_program: bool,
     /// Every glTF primitive imported from this asset.  The current retained
@@ -56,6 +58,29 @@ pub struct PreparedAsset {
     pub retained_topology: Option<PrimitiveTopology>,
     /// True when a source material declares glTF `doubleSided`.
     pub retained_double_sided: bool,
+}
+
+#[derive(Clone, Copy)]
+pub struct PreparedTexture {
+    pub name: &'static str,
+    pub bytes: &'static [u8],
+}
+
+impl PreparedTexture {
+    pub const NONE: Self = Self {
+        name: "",
+        bytes: &[],
+    };
+}
+
+#[derive(Clone, Copy)]
+pub struct PreparedMaterial {
+    pub base_color: PreparedTexture,
+    pub metallic_roughness: PreparedTexture,
+    pub emissive: PreparedTexture,
+    pub occlusion: PreparedTexture,
+    pub normal: PreparedTexture,
+    pub emissive_factor: [f32; 3],
 }
 
 /// One primitive's ranges in a build-prepared asset.
@@ -89,7 +114,16 @@ include!(concat!(env!("OUT_DIR"), "/prepared_assets.rs"));
 struct DatabasePreparedAsset {
     vertices: Vec<u8>,
     indices: Vec<u8>,
+    material: DatabasePreparedMaterial,
+}
+
+struct DatabasePreparedMaterial {
     base_color: Vec<u8>,
+    metallic_roughness: Vec<u8>,
+    emissive: Vec<u8>,
+    occlusion: Vec<u8>,
+    normal: Vec<u8>,
+    emissive_factor: [f32; 3],
 }
 
 struct DatabasePreparedCatalog {
@@ -327,7 +361,7 @@ pub struct GeometryProbe {
     queue: Queue,
     asset_vertex_buffers: [Option<Buffer>; ASSET_COUNT],
     asset_index_buffers: [Option<Buffer>; ASSET_COUNT],
-    base_color_textures: [Option<trueos::vmedia::RetainedTexture>; ASSET_COUNT],
+    material_textures: [ResidentMaterial; ASSET_COUNT],
     retained_meshes: [Option<RetainedMesh>; ASSET_COUNT],
     selected_asset: usize,
     number_keys: u8,
@@ -336,6 +370,15 @@ pub struct GeometryProbe {
     timeline: u64,
     previous_elapsed_millis: u64,
     previous_view_projection: [f32; 16],
+}
+
+#[derive(Default)]
+struct ResidentMaterial {
+    base_color: Option<trueos::vmedia::RetainedTexture>,
+    metallic_roughness: Option<trueos::vmedia::RetainedTexture>,
+    emissive: Option<trueos::vmedia::RetainedTexture>,
+    occlusion: Option<trueos::vmedia::RetainedTexture>,
+    normal: Option<trueos::vmedia::RetainedTexture>,
 }
 
 #[derive(Clone, Copy)]
@@ -395,7 +438,7 @@ impl GeometryProbe {
             let runtime_asset = &catalog.assets[slot];
             if runtime_asset.vertices.len() != asset.vertices.len()
                 || runtime_asset.indices.len() != asset.indices.len()
-                || runtime_asset.base_color.len() != asset.base_color_bytes.len()
+                || !material_matches(&runtime_asset.material, asset.material)
             {
                 return Err(GeometryProbeError::Contract);
             }
@@ -454,7 +497,7 @@ impl GeometryProbe {
             queue,
             asset_vertex_buffers,
             asset_index_buffers,
-            base_color_textures: core::array::from_fn(|_| None),
+            material_textures: core::array::from_fn(|_| ResidentMaterial::default()),
             retained_meshes,
             selected_asset: 0,
             number_keys: 0,
@@ -467,46 +510,55 @@ impl GeometryProbe {
         // Move the Blender-style editor camera, never the world objects.
         probe.flycam.set_look_sensitivity(FLYCAM_LOOK_SENSITIVITY);
         for (slot, asset) in ASSETS.iter().enumerate() {
-            let encoded = &catalog.assets[slot].base_color;
-            if !asset.sampled_material || encoded.is_empty() {
-                continue;
+            let runtime_material = &catalog.assets[slot].material;
+            // Keep the bundle local until every requested decode has reached
+            // the owner-scoped Render1 carrier. Any error drops the completed
+            // members and therefore releases the partial admission.
+            let material = ResidentMaterial {
+                base_color: decode_material_texture(
+                    probe.device,
+                    asset.name,
+                    "base-color",
+                    asset.material.base_color,
+                    &runtime_material.base_color,
+                )?,
+                metallic_roughness: decode_material_texture(
+                    probe.device,
+                    asset.name,
+                    "metallic-roughness",
+                    asset.material.metallic_roughness,
+                    &runtime_material.metallic_roughness,
+                )?,
+                emissive: decode_material_texture(
+                    probe.device,
+                    asset.name,
+                    "emissive",
+                    asset.material.emissive,
+                    &runtime_material.emissive,
+                )?,
+                occlusion: decode_material_texture(
+                    probe.device,
+                    asset.name,
+                    "occlusion",
+                    asset.material.occlusion,
+                    &runtime_material.occlusion,
+                )?,
+                normal: decode_material_texture(
+                    probe.device,
+                    asset.name,
+                    "normal",
+                    asset.material.normal,
+                    &runtime_material.normal,
+                )?,
+            };
+            if asset.sampled_material
+                && (material.base_color.is_none()
+                    || material.emissive.is_none()
+                    || asset.material.emissive_factor != [1.0; 3])
+            {
+                return Err(GeometryProbeError::Contract);
             }
-            let texture = trueos::async_fs::block_on(trueos::vmedia::decode_retained_asset(
-                probe.device,
-                asset.base_color_name,
-                encoded,
-            ));
-            match texture {
-                Ok(texture) => {
-                    let info = texture.info();
-                    logl::log(
-                        level::INFO,
-                        format_args!(
-                            "PicassoExample: texture proof accepted=1 asset={} role=base-color encoded_bytes={} texture_id=0x{:X} decoded={}x{} stride={} residency={:?} kernel_rgba_readback=0",
-                            asset.name,
-                            encoded.len(),
-                            info.id.raw(),
-                            info.width,
-                            info.height,
-                            info.stride_bytes,
-                            info.residency,
-                        ),
-                    );
-                    probe.base_color_textures[slot] = Some(texture);
-                }
-                Err(code) => {
-                    logl::log(
-                        level::ERROR,
-                        format_args!(
-                            "PicassoExample: texture proof accepted=0 asset={} role=base-color encoded_bytes={} error={} action=abort-textured-scene-contract",
-                            asset.name,
-                            encoded.len(),
-                            code,
-                        ),
-                    );
-                    return Err(GeometryProbeError::Vgpu("base-color-texture-decode", code));
-                }
-            }
+            probe.material_textures[slot] = material;
         }
         probe.render_frame(0)?;
         Ok(probe)
@@ -550,13 +602,17 @@ impl GeometryProbe {
                     .ok_or(GeometryProbeError::Contract)?,
                 RetainedFrameSubmit {
                     camera,
-                    base_color_texture: if ASSETS[self.selected_asset].sampled_material {
-                        self.base_color_textures[self.selected_asset]
-                            .as_ref()
-                            .map(|texture| texture.id().raw())
-                            .unwrap_or(0)
-                    } else {
-                        0
+                    material: RetainedMaterial {
+                        textures: retained_material_texture_ids(
+                            &self.material_textures[self.selected_asset],
+                            ASSETS[self.selected_asset].sampled_material,
+                        ),
+                        emissive_factor: if ASSETS[self.selected_asset].sampled_material {
+                            ASSETS[self.selected_asset].material.emissive_factor
+                        } else {
+                            [0.0; 3]
+                        },
+                        ..RetainedMaterial::default()
                     },
                     clear_rgba8_srgb: u32::from_le_bytes([0, 128, 0, 0]),
                     seed_count: retained_seed_count(ASSETS[self.selected_asset].helmet_program),
@@ -984,6 +1040,95 @@ fn write_exact(device: Device, buffer: Buffer, offset: u64, bytes: &[u8]) -> Res
         .ok_or(trueos::vgpu::ERR_IO)
 }
 
+fn material_matches(runtime: &DatabasePreparedMaterial, prepared: PreparedMaterial) -> bool {
+    runtime.base_color.len() == prepared.base_color.bytes.len()
+        && runtime.metallic_roughness.len() == prepared.metallic_roughness.bytes.len()
+        && runtime.emissive.len() == prepared.emissive.bytes.len()
+        && runtime.occlusion.len() == prepared.occlusion.bytes.len()
+        && runtime.normal.len() == prepared.normal.bytes.len()
+        && runtime.emissive_factor == prepared.emissive_factor
+}
+
+fn retained_material_texture_ids(material: &ResidentMaterial, sampled: bool) -> [u64; 5] {
+    if !sampled {
+        return [0; 5];
+    }
+    [
+        material
+            .base_color
+            .as_ref()
+            .map_or(0, |texture| texture.id().raw()),
+        material
+            .metallic_roughness
+            .as_ref()
+            .map_or(0, |texture| texture.id().raw()),
+        material
+            .emissive
+            .as_ref()
+            .map_or(0, |texture| texture.id().raw()),
+        material
+            .occlusion
+            .as_ref()
+            .map_or(0, |texture| texture.id().raw()),
+        material
+            .normal
+            .as_ref()
+            .map_or(0, |texture| texture.id().raw()),
+    ]
+}
+
+fn decode_material_texture(
+    device: Device,
+    asset_name: &str,
+    role: &str,
+    prepared: PreparedTexture,
+    encoded: &[u8],
+) -> Result<Option<trueos::vmedia::RetainedTexture>, GeometryProbeError> {
+    if prepared.bytes.is_empty() {
+        return encoded
+            .is_empty()
+            .then_some(None)
+            .ok_or(GeometryProbeError::Contract);
+    }
+    if prepared.name.is_empty() || encoded.len() != prepared.bytes.len() {
+        return Err(GeometryProbeError::Contract);
+    }
+    let texture = trueos::async_fs::block_on(trueos::vmedia::decode_retained_asset(
+        device,
+        prepared.name,
+        encoded,
+    ))
+    .map_err(|code| {
+        logl::log(
+            level::ERROR,
+            format_args!(
+                "PicassoExample: material bundle accepted=0 asset={} role={} encoded_bytes={} error={} action=release-partial-bundle",
+                asset_name,
+                role,
+                encoded.len(),
+                code,
+            ),
+        );
+        GeometryProbeError::Vgpu("material-texture-decode", code)
+    })?;
+    let info = texture.info();
+    logl::log(
+        level::INFO,
+        format_args!(
+            "PicassoExample: material bundle member accepted=1 asset={} role={} encoded_bytes={} texture_id=0x{:X} decoded={}x{} stride={} residency={:?} kernel_rgba_readback=0",
+            asset_name,
+            role,
+            encoded.len(),
+            info.id.raw(),
+            info.width,
+            info.height,
+            info.stride_bytes,
+            info.residency,
+        ),
+    );
+    Ok(Some(texture))
+}
+
 /// TRUEOS-specific materialization adapter. Field order is intentional: the
 /// ring is dropped before `memory`, so `VVideoMem` backs every live ring view.
 pub struct VVideoRing {
@@ -1101,12 +1246,34 @@ fn put_prepared_assets(picasso: &Picasso) -> Result<(), trueos_picasso::PicassoE
             &prepared_asset_key(asset.name, "mesh/indices"),
             asset.indices,
         )?;
+        for (role, texture) in [
+            ("base-color", asset.material.base_color),
+            ("metallic-roughness", asset.material.metallic_roughness),
+            ("emissive", asset.material.emissive),
+            ("occlusion", asset.material.occlusion),
+            ("normal", asset.material.normal),
+        ] {
+            picasso.put_embedded_asset(
+                &prepared_asset_key(asset.name, &format!("material/{role}")),
+                texture.bytes,
+            )?;
+        }
+        let emissive_factor = emissive_factor_bytes(asset.material.emissive_factor);
         picasso.put_embedded_asset(
-            &prepared_asset_key(asset.name, "material/base-color"),
-            asset.base_color_bytes,
+            &prepared_asset_key(asset.name, "material/emissive-factor.f32le"),
+            &emissive_factor,
         )?;
     }
     Ok(())
+}
+
+fn emissive_factor_bytes(factor: [f32; 3]) -> [u8; 12] {
+    let mut bytes = [0; 12];
+    for (channel, value) in factor.into_iter().enumerate() {
+        let offset = channel * core::mem::size_of::<f32>();
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    bytes
 }
 
 fn load_prepared_assets(
@@ -1124,15 +1291,50 @@ fn load_prepared_assets(
         else {
             return Ok(None);
         };
-        let Some(base_color) =
-            picasso.embedded_asset(&prepared_asset_key(asset.name, "material/base-color"))?
+        let mut material_bytes = Vec::with_capacity(5);
+        for role in [
+            "base-color",
+            "metallic-roughness",
+            "emissive",
+            "occlusion",
+            "normal",
+        ] {
+            let Some(bytes) = picasso
+                .embedded_asset(&prepared_asset_key(asset.name, &format!("material/{role}")))?
+            else {
+                return Ok(None);
+            };
+            material_bytes.push(bytes);
+        }
+        let Some(emissive_factor_bytes) = picasso.embedded_asset(&prepared_asset_key(
+            asset.name,
+            "material/emissive-factor.f32le",
+        ))?
+        else {
+            return Ok(None);
+        };
+        let Ok(emissive_factor_bytes) = <&[u8; 12]>::try_from(emissive_factor_bytes.as_slice())
         else {
             return Ok(None);
         };
         assets.push(DatabasePreparedAsset {
             vertices,
             indices,
-            base_color,
+            material: DatabasePreparedMaterial {
+                base_color: material_bytes.remove(0),
+                metallic_roughness: material_bytes.remove(0),
+                emissive: material_bytes.remove(0),
+                occlusion: material_bytes.remove(0),
+                normal: material_bytes.remove(0),
+                emissive_factor: core::array::from_fn(|channel| {
+                    let offset = channel * core::mem::size_of::<f32>();
+                    f32::from_le_bytes(
+                        emissive_factor_bytes[offset..offset + 4]
+                            .try_into()
+                            .expect("three f32 factor bytes"),
+                    )
+                }),
+            },
         });
     }
     Ok(Some(DatabasePreparedCatalog { assets }))
@@ -1248,10 +1450,14 @@ fn run() {
     logl::log(
         level::INFO,
         format_args!(
-            "PicassoExample: prepared opaque DamagedHelmet instances submitted and retired: vertices={} indices={} texture_bound={} timeline={}",
+            "PicassoExample: retained DamagedHelmet material bundle submitted and retired: vertices={} indices={} base_color_bound={} emissive_resident={} metallic_roughness_resident={} occlusion_resident={} normal_resident={} timeline={}",
             HELMET_VERTEX_COUNT,
             HELMET_INDEX_COUNT,
-            probe.base_color_textures[0].is_some() as u8,
+            probe.material_textures[0].base_color.is_some() as u8,
+            probe.material_textures[0].emissive.is_some() as u8,
+            probe.material_textures[0].metallic_roughness.is_some() as u8,
+            probe.material_textures[0].occlusion.is_some() as u8,
+            probe.material_textures[0].normal.is_some() as u8,
             probe.timeline(),
         ),
     );
@@ -1325,8 +1531,16 @@ mod tests {
     #[test]
     fn prepared_primitives_keep_source_ranges_and_topology() {
         for asset in ASSETS {
-            assert!(!asset.sampled_material);
-            assert_eq!(asset.vertex_stride, 24);
+            assert_eq!(
+                asset.sampled_material,
+                !asset.material.base_color.bytes.is_empty()
+                    && !asset.material.emissive.bytes.is_empty()
+                    && asset.material.emissive_factor == [1.0; 3]
+            );
+            assert_eq!(
+                asset.vertex_stride,
+                if asset.sampled_material { 32 } else { 24 }
+            );
             assert!(!asset.primitives.is_empty());
             for primitive in asset.primitives {
                 assert!(primitive.first_vertex < asset.vertex_count);
