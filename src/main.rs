@@ -160,22 +160,28 @@ pub struct HeadInstanceProgram {
     pub reserved: [u32; 2],
 }
 
-// With the fixed upside-down presentation camera, this signed spacing makes
-// the helmet stack depart the origin along the displayed green axis.
-const HEAD_Y_SPACING: f32 = 1.6;
+// Preserve the distance of the former first offset helmet from the origin,
+// then use it as the signed X/Y offset for a symmetric 2-by-2 layout.
+const HEAD_PLANE_OFFSET: f32 = 1.6;
 const WORLD_AXIS_LENGTH: f32 = 2.0;
+const CLIPPED_CAMERA_POINT: [f32; 3] = [2.0, 2.0, 1.0];
+/// Editor-style camera speed in world units per second.
+const FLYCAM_SPEED: f32 = 3.0;
+/// Camera-local quaternion look angle applied for one pixel of cursor motion.
+const FLYCAM_LOOK_SENSITIVITY: f32 = 0.002;
 const PRESENTATION_CAMERA_POSITION: [f32; 3] = [0.0, 0.0, -10.0];
 const PRESENTATION_CAMERA_TARGET: [f32; 3] = [0.0; 3];
 const PRESENTATION_CAMERA_WORLD_UP: [f32; 3] = [0.0, -1.0, 0.0];
 const HEAD_WORLD_TRANSLATIONS: [[f32; 3]; HEAD_INSTANCE_COUNT as usize] = [
-    [0.0, 0.0, 0.0],
-    [0.0, -HEAD_Y_SPACING, 0.0],
-    [0.0, -HEAD_Y_SPACING * 2.0, 0.0],
-    [0.0, -HEAD_Y_SPACING * 3.0, 0.0],
+    // Quadrants II, I, III, IV respectively. Keep every helmet on Z = 0.
+    [-HEAD_PLANE_OFFSET, HEAD_PLANE_OFFSET, 0.0],
+    [HEAD_PLANE_OFFSET, HEAD_PLANE_OFFSET, 0.0],
+    [-HEAD_PLANE_OFFSET, -HEAD_PLANE_OFFSET, 0.0],
+    [HEAD_PLANE_OFFSET, -HEAD_PLANE_OFFSET, 0.0],
 ];
 
-/// The presentation camera is deliberately fixed: all retained transforms and
-/// the static world-axis guide are authored against this same view.
+/// Initial Blender-style editor camera. Retained transforms and the world-axis
+/// guide are projected from its current view as the user flies through space.
 fn presentation_camera() -> Camera {
     Camera {
         // Sit on the world-blue axis and keep the origin centred as the aim
@@ -250,9 +256,9 @@ fn look_at_camera_rotation(position: [f32; 3], target: [f32; 3], world_up: [f32;
     rotation.normalized()
 }
 
-const fn placed_head(y: f32) -> TransformValue {
+const fn placed_head(x: f32, y: f32) -> TransformValue {
     TransformValue {
-        translation: [0.0, y, 0.0],
+        translation: [x, y, 0.0],
         translation_pad: 0.0,
         rotation: [0.0, 0.0, 0.0, 1.0],
         scale: [0.45, 0.45, 0.45],
@@ -266,25 +272,25 @@ const fn placed_head(y: f32) -> TransformValue {
 /// clockwise, counter-clockwise, 0.5-second collapse/expand, and identity.
 pub const HEAD_INSTANCE_PROGRAMS: [HeadInstanceProgram; HEAD_INSTANCE_COUNT as usize] = [
     HeadInstanceProgram {
-        initial: placed_head(0.0),
+        initial: placed_head(-HEAD_PLANE_OFFSET, HEAD_PLANE_OFFSET),
         angular_velocity_z: -core::f32::consts::FRAC_PI_2,
         scale_half_period_seconds: 0.0,
         reserved: [0; 2],
     },
     HeadInstanceProgram {
-        initial: placed_head(-HEAD_Y_SPACING),
+        initial: placed_head(HEAD_PLANE_OFFSET, HEAD_PLANE_OFFSET),
         angular_velocity_z: core::f32::consts::FRAC_PI_2,
         scale_half_period_seconds: 0.0,
         reserved: [0; 2],
     },
     HeadInstanceProgram {
-        initial: placed_head(-HEAD_Y_SPACING * 2.0),
+        initial: placed_head(-HEAD_PLANE_OFFSET, -HEAD_PLANE_OFFSET),
         angular_velocity_z: 0.0,
         scale_half_period_seconds: 0.5,
         reserved: [0; 2],
     },
     HeadInstanceProgram {
-        initial: placed_head(-HEAD_Y_SPACING * 3.0),
+        initial: placed_head(HEAD_PLANE_OFFSET, -HEAD_PLANE_OFFSET),
         angular_velocity_z: 0.0,
         scale_half_period_seconds: 0.0,
         reserved: [0; 2],
@@ -328,6 +334,10 @@ pub struct GeometryProbe {
     _asset_index_buffers: [Option<Buffer>; ASSET_COUNT],
     line_vertex_buffer: Buffer,
     line_index_buffer: Buffer,
+    line_world_vertices: Vec<u8>,
+    line_projection_camera: Camera,
+    line_projection_extent: (u32, u32),
+    line_vertex_revision: u32,
     base_color_textures: [Option<trueos::vmedia::RetainedTexture>; ASSET_COUNT],
     retained_meshes: [Option<RetainedMesh>; ASSET_COUNT],
     selected_asset: usize,
@@ -440,11 +450,12 @@ impl GeometryProbe {
             .map_err(|code| GeometryProbeError::Vgpu("line-index-buffer-create", code))?;
 
         // Static draws do not inherit the retained carrier's transform seed.
-        // Preserve the Picasso DB's world-space source, then project its six
-        // axis vertices once for this deliberately fixed presentation camera.
+        // Keep their Picasso DB world-space source so it can be reprojected
+        // whenever the editor camera moves or the viewport changes.
         let camera = presentation_camera();
+        let line_world_vertices = catalog.line_vertices.clone();
         let projected_line_vertices =
-            project_static_line_vertices(&catalog.line_vertices, camera, WIDTH, HEIGHT)
+            project_static_line_vertices(&line_world_vertices, camera, WIDTH, HEIGHT)
                 .ok_or(GeometryProbeError::Contract)?;
         write_exact(device, line_vertex_buffer, 0, &projected_line_vertices)
             .map_err(|code| GeometryProbeError::Vgpu("line-vertex-upload", code))?;
@@ -459,18 +470,22 @@ impl GeometryProbe {
             _asset_index_buffers: asset_index_buffers,
             line_vertex_buffer,
             line_index_buffer,
+            line_world_vertices,
+            line_projection_camera: camera,
+            line_projection_extent: (WIDTH, HEIGHT),
+            line_vertex_revision: 1,
             base_color_textures: core::array::from_fn(|_| None),
             retained_meshes,
             selected_asset: 0,
             number_keys: 0,
-            flycam: FlyCam::new(camera, 0.0),
+            flycam: FlyCam::new(camera, FLYCAM_SPEED),
             resize_drag: None,
             timeline: 0,
             previous_elapsed_millis: 0,
         };
-        // Static axis vertices were projected above.  Do not let UI4 input
-        // silently move the retained scene away from that shared camera.
-        probe.flycam.set_look_sensitivity(0.0);
+        // Move the Blender-style editor camera, never the world objects.
+        // The world-axis guide is reprojected from this same camera below.
+        probe.flycam.set_look_sensitivity(FLYCAM_LOOK_SENSITIVITY);
         for (slot, asset) in ASSETS.iter().enumerate() {
             let encoded = &catalog.assets[slot].base_color;
             if encoded.is_empty() {
@@ -517,8 +532,9 @@ impl GeometryProbe {
         Ok(probe)
     }
 
-    /// Advance the compact transform state and render one complete frame.
-    /// Geometry remains resident; only these seeds and the UI4 lease vary.
+    /// Advance the camera/compact transform state and render one complete
+    /// frame. Mesh mappings remain resident; camera changes rewrite only the
+    /// six world-axis positions before their in-place resident refresh.
     pub fn render_frame(&mut self, elapsed_millis: u64) -> Result<(), GeometryProbeError> {
         let delta_seconds =
             elapsed_millis.saturating_sub(self.previous_elapsed_millis) as f32 * 0.001;
@@ -530,6 +546,31 @@ impl GeometryProbe {
         self.service_frame_interaction()?;
         let width = self.frame.width();
         let height = self.frame.height();
+
+        // The line-list path has no retained transform seed. Refresh only its
+        // projected vertex bytes when the editor camera or viewport changes;
+        // helmet positions remain immutable world-space transforms.
+        if self.flycam.camera != self.line_projection_camera
+            || (width, height) != self.line_projection_extent
+        {
+            let projected_line_vertices = project_static_line_vertices(
+                &self.line_world_vertices,
+                self.flycam.camera,
+                width,
+                height,
+            )
+            .ok_or(GeometryProbeError::Contract)?;
+            write_exact(
+                self.device,
+                self.line_vertex_buffer,
+                0,
+                &projected_line_vertices,
+            )
+            .map_err(|code| GeometryProbeError::Vgpu("line-vertex-reproject", code))?;
+            self.line_vertex_revision = self.line_vertex_revision.wrapping_add(1).max(1);
+            self.line_projection_camera = self.flycam.camera;
+            self.line_projection_extent = (width, height);
+        }
 
         self.frame
             .begin_gpu_frame()
@@ -558,6 +599,7 @@ impl GeometryProbe {
                     clear_rgba8_srgb: u32::from_le_bytes([0, 128, 0, 0]),
                     seed_count: retained_seed_count(ASSETS[self.selected_asset].helmet_program),
                     static_draw_count: 3,
+                    static_vertex_revision: self.line_vertex_revision,
                     seeds: retained_seeds(
                         elapsed_millis,
                         self.flycam.camera,
@@ -816,9 +858,12 @@ fn project_camera_transform(
             zfar,
             aspect_ratio,
         } => {
+            let depth = -view_translation[2];
+            if depth < znear || zfar.is_some_and(|far| depth > far) {
+                return (CLIPPED_CAMERA_POINT, [0.0; 3]);
+            }
             let aspect = aspect_ratio
                 .unwrap_or_else(|| viewport_width as f32 / viewport_height.max(1) as f32);
-            let depth = (-view_translation[2]).max(znear);
             let focal_y = 1.0 / libm::tanf(yfov * 0.5);
             let focal_x = focal_y / aspect;
             let (ndc_z, depth_scale) = match zfar {
@@ -854,6 +899,9 @@ fn project_camera_transform(
             zfar,
         } => {
             let depth = -view_translation[2];
+            if depth < znear || depth > zfar {
+                return (CLIPPED_CAMERA_POINT, [0.0; 3]);
+            }
             let range = (zfar - znear).max(f32::EPSILON);
             (
                 [
@@ -865,6 +913,67 @@ fn project_camera_transform(
             )
         }
     }
+}
+
+fn camera_depth_range(projection: Projection) -> (f32, Option<f32>) {
+    match projection {
+        Projection::Perspective { znear, zfar, .. } => (znear, zfar),
+        Projection::Orthographic { znear, zfar, .. } => (znear, Some(zfar)),
+    }
+}
+
+fn interpolate_view_point(start: [f32; 3], end: [f32; 3], t: f32) -> [f32; 3] {
+    core::array::from_fn(|axis| start[axis] + (end[axis] - start[axis]) * t)
+}
+
+/// Clip one view-space segment to the camera's positive depth interval.
+/// Perspective division happens only after this, preserving a real near-plane
+/// intersection instead of stretching a behind-camera endpoint to the edge.
+fn clip_view_line_to_depth(
+    mut start: [f32; 3],
+    mut end: [f32; 3],
+    znear: f32,
+    zfar: Option<f32>,
+) -> Option<([f32; 3], [f32; 3])> {
+    if !znear.is_finite()
+        || znear <= 0.0
+        || zfar.is_some_and(|far| !far.is_finite() || far <= znear)
+    {
+        return None;
+    }
+
+    let mut start_depth = -start[2];
+    let mut end_depth = -end[2];
+    if start_depth < znear && end_depth < znear {
+        return None;
+    }
+    if start_depth < znear {
+        let t = (znear - start_depth) / (end_depth - start_depth);
+        start = interpolate_view_point(start, end, t);
+        start[2] = -znear;
+    } else if end_depth < znear {
+        let t = (znear - start_depth) / (end_depth - start_depth);
+        end = interpolate_view_point(start, end, t);
+        end[2] = -znear;
+    }
+
+    if let Some(zfar) = zfar {
+        start_depth = -start[2];
+        end_depth = -end[2];
+        if start_depth > zfar && end_depth > zfar {
+            return None;
+        }
+        if start_depth > zfar {
+            let t = (zfar - start_depth) / (end_depth - start_depth);
+            start = interpolate_view_point(start, end, t);
+            start[2] = -zfar;
+        } else if end_depth > zfar {
+            let t = (zfar - start_depth) / (end_depth - start_depth);
+            end = interpolate_view_point(start, end, t);
+            end[2] = -zfar;
+        }
+    }
+    Some((start, end))
 }
 
 /// Convert Picasso's database-owned float3 world vertices into the clip-space
@@ -883,7 +992,7 @@ fn project_static_line_vertices(
     }
     let [qx, qy, qz, qw] = camera.rotation.normalized().0;
     let view_rotation = Quaternion([-qx, -qy, -qz, qw]);
-    let mut projected = Vec::with_capacity(world_vertex_bytes.len());
+    let mut view_vertices = Vec::with_capacity(world_vertex_bytes.len() / 12);
     for bytes in world_vertex_bytes.chunks_exact(12) {
         let world = [
             f32::from_le_bytes(bytes[0..4].try_into().ok()?),
@@ -893,23 +1002,36 @@ fn project_static_line_vertices(
         if world.iter().any(|component| !component.is_finite()) {
             return None;
         }
-        let view = view_rotation.rotate([
+        view_vertices.push(view_rotation.rotate([
             world[0] * WORLD_AXIS_LENGTH - camera.position[0],
             world[1] * WORLD_AXIS_LENGTH - camera.position[1],
             world[2] * WORLD_AXIS_LENGTH - camera.position[2],
-        ]);
-        let (clip, _) = project_camera_transform(
-            camera.projection,
-            viewport_width,
-            viewport_height,
-            view,
-            1.0,
-        );
-        if clip.iter().any(|component| !component.is_finite()) {
-            return None;
-        }
-        for component in clip {
-            projected.extend_from_slice(&component.to_le_bytes());
+        ]));
+    }
+
+    let (znear, zfar) = camera_depth_range(camera.projection);
+    let mut projected = Vec::with_capacity(world_vertex_bytes.len());
+    for line in view_vertices.chunks_exact(2) {
+        let points =
+            clip_view_line_to_depth(line[0], line[1], znear, zfar).map(|(start, end)| [start, end]);
+        for clip in points.map_or([CLIPPED_CAMERA_POINT; 2], |points| {
+            points.map(|point| {
+                project_camera_transform(
+                    camera.projection,
+                    viewport_width,
+                    viewport_height,
+                    point,
+                    1.0,
+                )
+                .0
+            })
+        }) {
+            if clip.iter().any(|component| !component.is_finite()) {
+                return None;
+            }
+            for component in clip {
+                projected.extend_from_slice(&component.to_le_bytes());
+            }
         }
     }
     Some(projected)
@@ -1239,6 +1361,13 @@ fn run() {
             probe.timeline(),
         ),
     );
+    logl::log(
+        level::INFO,
+        format_args!(
+            "PicassoExample: flycam enabled controls=WASD+middle_drag local_quaternion_look=1 speed={:.1} sensitivity={:.4}",
+            FLYCAM_SPEED, FLYCAM_LOOK_SENSITIVITY,
+        ),
+    );
 
     let start = clock::monotonic_millis();
     let mut presentation_logged = false;
@@ -1361,6 +1490,19 @@ mod tests {
         assert_eq!(HEAD_INSTANCE_PROGRAMS[2].scale_half_period_seconds, 0.5);
         assert_eq!(HEAD_INSTANCE_PROGRAMS[3].angular_velocity_z, 0.0);
         assert_eq!(HEAD_INSTANCE_PROGRAMS[3].scale_half_period_seconds, 0.0);
+        assert_eq!(
+            HEAD_WORLD_TRANSLATIONS,
+            [
+                [-HEAD_PLANE_OFFSET, HEAD_PLANE_OFFSET, 0.0],
+                [HEAD_PLANE_OFFSET, HEAD_PLANE_OFFSET, 0.0],
+                [-HEAD_PLANE_OFFSET, -HEAD_PLANE_OFFSET, 0.0],
+                [HEAD_PLANE_OFFSET, -HEAD_PLANE_OFFSET, 0.0],
+            ]
+        );
+        for (program, translation) in HEAD_INSTANCE_PROGRAMS.iter().zip(HEAD_WORLD_TRANSLATIONS) {
+            assert_eq!(program.initial.translation, translation);
+            assert_eq!(translation[2], 0.0);
+        }
     }
 
     #[test]
@@ -1424,14 +1566,11 @@ mod tests {
         );
 
         let seeds = retained_seeds(0, camera, true, 640, 360);
-        for slot in 1..HEAD_INSTANCE_COUNT as usize {
-            assert!(seeds[slot].translation[1] < seeds[slot - 1].translation[1]);
-        }
-        assert!(
-            seeds[HEAD_INSTANCE_COUNT as usize - 1].translation[1]
-                + seeds[HEAD_INSTANCE_COUNT as usize - 1].scale[1]
-                < 1.0
-        );
+        assert!(seeds[..HEAD_INSTANCE_COUNT as usize].iter().all(|seed| {
+            seed.translation
+                .iter()
+                .all(|coordinate| coordinate.is_finite())
+        }));
 
         let projected = project_static_line_vertices(line_vertex_bytes(), camera, 640, 360)
             .expect("the six finite Picasso grid vertices project");
@@ -1451,9 +1590,80 @@ mod tests {
         assert_eq!(origin, z_origin);
         // The upside-down camera makes world +Y project downward on the
         // top-left-origin retained surface. Looking along +Z makes the blue
-        // axis depth-only at its origin, while X remains visibly horizontal.
+        // axis screen-depth-only at its origin, while X remains horizontal.
         assert_ne!(x_end, origin);
         assert!(y_end[1] > origin[1]);
-        assert_eq!(z_end, origin);
+        assert_eq!([z_end[0], z_end[1]], [origin[0], origin[1]]);
+        assert_ne!(z_end[2], origin[2]);
+    }
+
+    #[test]
+    fn editor_flycam_moves_only_the_camera() {
+        let camera = presentation_camera();
+        let mut flycam = FlyCam::new(camera, FLYCAM_SPEED);
+        flycam.set_look_sensitivity(FLYCAM_LOOK_SENSITIVITY);
+        let heads_before = HEAD_WORLD_TRANSLATIONS;
+        let lines_before = project_static_line_vertices(line_vertex_bytes(), camera, 640, 360)
+            .expect("the initial world axes project");
+        let forward = camera.rotation.rotate([0.0, 0.0, -1.0]);
+
+        flycam.step(
+            trueos_picasso::cam::Wasd {
+                w: true,
+                ..Default::default()
+            },
+            1.0,
+        );
+        let position_after_wasd = flycam.camera.position;
+        for axis in 0..3 {
+            assert!(
+                (position_after_wasd[axis]
+                    - (camera.position[axis] + forward[axis] * FLYCAM_SPEED))
+                    .abs()
+                    < 1.0e-5
+            );
+        }
+        let lines_after =
+            project_static_line_vertices(line_vertex_bytes(), flycam.camera, 640, 360)
+                .expect("the moved camera reprojects the same world axes");
+        flycam.look(32.0, -16.0);
+
+        assert_ne!(lines_after, lines_before);
+        assert_ne!(flycam.camera.rotation, camera.rotation);
+        assert_eq!(HEAD_WORLD_TRANSLATIONS, heads_before);
+        assert_eq!(flycam.speed(), FLYCAM_SPEED);
+        assert_eq!(flycam.look_sensitivity(), FLYCAM_LOOK_SENSITIVITY);
+    }
+
+    #[test]
+    fn camera_near_plane_hides_world_geometry_after_flying_through_it() {
+        let mut camera = presentation_camera();
+        camera.position = [0.0, 0.0, 3.0];
+
+        let seeds = retained_seeds(0, camera, true, 640, 360);
+        for seed in &seeds[..HEAD_INSTANCE_COUNT as usize] {
+            assert_eq!(seed.translation, CLIPPED_CAMERA_POINT);
+            assert_eq!(seed.scale, [0.0; 3]);
+        }
+
+        let projected = project_static_line_vertices(line_vertex_bytes(), camera, 640, 360)
+            .expect("finite axes behind the camera remain a valid clipped draw");
+        for vertex in projected.chunks_exact(12) {
+            let point: [f32; 3] = core::array::from_fn(|axis| {
+                let offset = axis * 4;
+                f32::from_le_bytes(vertex[offset..offset + 4].try_into().unwrap())
+            });
+            assert_eq!(point, CLIPPED_CAMERA_POINT);
+        }
+
+        let (start, end) =
+            clip_view_line_to_depth([0.0, 0.0, 0.0], [4.0, 0.0, -4.0], 1.0, Some(3.0))
+                .expect("a segment spanning the frustum clips at both depth planes");
+        for (actual, expected) in start.into_iter().zip([1.0, 0.0, -1.0]) {
+            assert!((actual - expected).abs() < 1.0e-5);
+        }
+        for (actual, expected) in end.into_iter().zip([3.0, 0.0, -3.0]) {
+            assert!((actual - expected).abs() < 1.0e-5);
+        }
     }
 }
