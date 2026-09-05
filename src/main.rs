@@ -18,9 +18,10 @@ use trueos::vgpu::{
     Capabilities, Device, PRIMITIVE_TOPOLOGY_LINE_LIST, PRIMITIVE_TOPOLOGY_LINE_LOOP,
     PRIMITIVE_TOPOLOGY_LINE_STRIP, PRIMITIVE_TOPOLOGY_POINT_LIST, PRIMITIVE_TOPOLOGY_TRIANGLE_FAN,
     PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, Queue, QueueClass,
-    RETAINED_VERTEX_LAYOUT_POS_NORMAL, RETAINED_VERTEX_LAYOUT_POS_NORMAL_UV, RetainedCamera,
-    RetainedFrameSubmit, RetainedMaterial, RetainedMesh, RetainedMeshDescriptor,
-    RetainedTransformSeed, VVideoMem,
+    RETAINED_VERTEX_LAYOUT_POS_NORMAL, RETAINED_VERTEX_LAYOUT_POS_NORMAL_UV_TANGENT,
+    RetainedCamera, RetainedFrameSubmit, RetainedFrameSubmitV2, RetainedMaterial,
+    RetainedMaterialParameters, RetainedMesh, RetainedMeshDescriptor, RetainedTransformSeed,
+    VVideoMem,
 };
 use trueos::{
     clock,
@@ -80,7 +81,7 @@ pub struct PreparedMaterial {
     pub emissive: PreparedTexture,
     pub occlusion: PreparedTexture,
     pub normal: PreparedTexture,
-    pub emissive_factor: [f32; 3],
+    pub parameters: RetainedMaterialParameters,
 }
 
 /// One primitive's ranges in a build-prepared asset.
@@ -123,7 +124,7 @@ struct DatabasePreparedMaterial {
     emissive: Vec<u8>,
     occlusion: Vec<u8>,
     normal: Vec<u8>,
-    emissive_factor: [f32; 3],
+    parameters: RetainedMaterialParameters,
 }
 
 struct DatabasePreparedCatalog {
@@ -132,7 +133,7 @@ struct DatabasePreparedCatalog {
 
 pub const HELMET_VERTEX_COUNT: u32 = ASSETS[0].vertex_count;
 pub const HELMET_INDEX_COUNT: u32 = ASSETS[0].index_count;
-pub const HELMET_VERTEX_BYTES: u64 = ASSETS[0].vertex_count as u64 * 12;
+pub const HELMET_VERTEX_BYTES: u64 = ASSETS[0].vertices.len() as u64;
 pub const HELMET_INDEX_BYTES: u64 = ASSETS[0].index_count as u64 * 4;
 
 pub const HELMET_VERTICES: ResourceId = ResourceId(0x0001_0000_0000_0001);
@@ -171,7 +172,7 @@ pub const fn prepared_geometry() -> ExecutablePrimitive {
             revision: 1,
         }),
         index_format: Some(trueos_picasso::IndexFormat::Uint32),
-        vertex_stride: 12,
+        vertex_stride: ASSETS[0].vertex_stride as u32,
         vertex_count: HELMET_VERTEX_COUNT,
         index_count: HELMET_INDEX_COUNT,
     }
@@ -362,6 +363,7 @@ pub struct GeometryProbe {
     asset_vertex_buffers: [Option<Buffer>; ASSET_COUNT],
     asset_index_buffers: [Option<Buffer>; ASSET_COUNT],
     material_textures: [ResidentMaterial; ASSET_COUNT],
+    material_parameters: [RetainedMaterialParameters; ASSET_COUNT],
     retained_meshes: [Option<RetainedMesh>; ASSET_COUNT],
     selected_asset: usize,
     number_keys: u8,
@@ -403,7 +405,7 @@ impl GeometryProbe {
 
         let primitive = prepared_geometry();
         let indices = primitive.indices.ok_or(GeometryProbeError::Contract)?;
-        if primitive.vertex_stride != 12
+        if primitive.vertex_stride != ASSETS[0].vertex_stride as u32
             || primitive.vertex_count == 0
             || primitive.index_count == 0
             || primitive.index_format != Some(trueos_picasso::IndexFormat::Uint32)
@@ -436,8 +438,8 @@ impl GeometryProbe {
         for slot in 0..ASSET_COUNT {
             let asset = &ASSETS[slot];
             let runtime_asset = &catalog.assets[slot];
-            if runtime_asset.vertices.len() != asset.vertices.len()
-                || runtime_asset.indices.len() != asset.indices.len()
+            if runtime_asset.vertices != asset.vertices
+                || runtime_asset.indices != asset.indices
                 || !material_matches(&runtime_asset.material, asset.material)
             {
                 return Err(GeometryProbeError::Contract);
@@ -466,7 +468,7 @@ impl GeometryProbe {
                         vertex_count: asset.vertex_count,
                         index_count: asset.index_count,
                         vertex_layout: if asset.sampled_material {
-                            RETAINED_VERTEX_LAYOUT_POS_NORMAL_UV
+                            RETAINED_VERTEX_LAYOUT_POS_NORMAL_UV_TANGENT
                         } else {
                             RETAINED_VERTEX_LAYOUT_POS_NORMAL
                         },
@@ -498,6 +500,9 @@ impl GeometryProbe {
             asset_vertex_buffers,
             asset_index_buffers,
             material_textures: core::array::from_fn(|_| ResidentMaterial::default()),
+            material_parameters: core::array::from_fn(|slot| {
+                catalog.assets[slot].material.parameters
+            }),
             retained_meshes,
             selected_asset: 0,
             number_keys: 0,
@@ -586,38 +591,45 @@ impl GeometryProbe {
             .device
             .acquire_ui4_surface(self.frame.window_id())
             .map_err(|code| GeometryProbeError::Vgpu("surface-acquire", code))?;
-        let point = self
-            .device
-            .submit_retained_frame(
+        let mesh = self.retained_meshes[self.selected_asset].ok_or(GeometryProbeError::Contract)?;
+        let vertices =
+            self.asset_vertex_buffers[self.selected_asset].ok_or(GeometryProbeError::Contract)?;
+        let indices =
+            self.asset_index_buffers[self.selected_asset].ok_or(GeometryProbeError::Contract)?;
+        let submit = RetainedFrameSubmit {
+            camera,
+            material: RetainedMaterial {
+                textures: retained_material_texture_ids(
+                    &self.material_textures[self.selected_asset],
+                    ASSETS[self.selected_asset].sampled_material,
+                ),
+                // V2 carries every scalar in material_parameters;
+                // the legacy scalar stays zero to avoid ambiguity.
+                emissive_factor: [0.0; 3],
+                ..RetainedMaterial::default()
+            },
+            clear_rgba8_srgb: u32::from_le_bytes([0, 128, 0, 0]),
+            seed_count: retained_seed_count(ASSETS[self.selected_asset].helmet_program),
+            seeds: retained_seeds(elapsed_millis, ASSETS[self.selected_asset].helmet_program),
+            ..RetainedFrameSubmit::default()
+        };
+        let point = if ASSETS[self.selected_asset].sampled_material {
+            self.device.submit_retained_frame_v2(
                 self.queue,
                 surface,
-                self.retained_meshes[self.selected_asset].ok_or(GeometryProbeError::Contract)?,
-                self.asset_vertex_buffers[self.selected_asset]
-                    .ok_or(GeometryProbeError::Contract)?,
-                self.asset_index_buffers[self.selected_asset]
-                    .ok_or(GeometryProbeError::Contract)?,
-                RetainedFrameSubmit {
-                    camera,
-                    material: RetainedMaterial {
-                        textures: retained_material_texture_ids(
-                            &self.material_textures[self.selected_asset],
-                            ASSETS[self.selected_asset].sampled_material,
-                        ),
-                        // The base-color-only rung has no factor uniform.
-                        // Keep the ABI's reserved emissive factor at zero.
-                        emissive_factor: [0.0; 3],
-                        ..RetainedMaterial::default()
-                    },
-                    clear_rgba8_srgb: u32::from_le_bytes([0, 128, 0, 0]),
-                    seed_count: retained_seed_count(ASSETS[self.selected_asset].helmet_program),
-                    seeds: retained_seeds(
-                        elapsed_millis,
-                        ASSETS[self.selected_asset].helmet_program,
-                    ),
-                    ..RetainedFrameSubmit::default()
+                mesh,
+                vertices,
+                indices,
+                RetainedFrameSubmitV2 {
+                    frame: submit,
+                    material_parameters: self.material_parameters[self.selected_asset],
                 },
             )
-            .map_err(|code| GeometryProbeError::Vgpu("retained-frame-submit", code))?;
+        } else {
+            self.device
+                .submit_retained_frame(self.queue, surface, mesh, vertices, indices, submit)
+        }
+        .map_err(|code| GeometryProbeError::Vgpu("retained-frame-submit", code))?;
         self.device
             .wait(self.queue, point.value)
             .map_err(|code| GeometryProbeError::Vgpu("timeline-wait", code))?;
@@ -1035,12 +1047,12 @@ fn write_exact(device: Device, buffer: Buffer, offset: u64, bytes: &[u8]) -> Res
 }
 
 fn material_matches(runtime: &DatabasePreparedMaterial, prepared: PreparedMaterial) -> bool {
-    runtime.base_color.len() == prepared.base_color.bytes.len()
-        && runtime.metallic_roughness.len() == prepared.metallic_roughness.bytes.len()
-        && runtime.emissive.len() == prepared.emissive.bytes.len()
-        && runtime.occlusion.len() == prepared.occlusion.bytes.len()
-        && runtime.normal.len() == prepared.normal.bytes.len()
-        && runtime.emissive_factor == prepared.emissive_factor
+    runtime.base_color == prepared.base_color.bytes
+        && runtime.metallic_roughness == prepared.metallic_roughness.bytes
+        && runtime.emissive == prepared.emissive.bytes
+        && runtime.occlusion == prepared.occlusion.bytes
+        && runtime.normal == prepared.normal.bytes
+        && runtime.parameters == prepared.parameters
 }
 
 fn retained_material_texture_ids(material: &ResidentMaterial, sampled: bool) -> [u64; 5] {
@@ -1052,12 +1064,22 @@ fn retained_material_texture_ids(material: &ResidentMaterial, sampled: bool) -> 
             .base_color
             .as_ref()
             .map_or(0, |texture| texture.id().raw()),
-        // The other decoded bundle members remain unbound until their shader
-        // consumers exist. This rung isolates base color only.
-        0,
-        0,
-        0,
-        0,
+        material
+            .metallic_roughness
+            .as_ref()
+            .map_or(0, |texture| texture.id().raw()),
+        material
+            .emissive
+            .as_ref()
+            .map_or(0, |texture| texture.id().raw()),
+        material
+            .occlusion
+            .as_ref()
+            .map_or(0, |texture| texture.id().raw()),
+        material
+            .normal
+            .as_ref()
+            .map_or(0, |texture| texture.id().raw()),
     ]
 }
 
@@ -1242,22 +1264,93 @@ fn put_prepared_assets(picasso: &Picasso) -> Result<(), trueos_picasso::PicassoE
                 texture.bytes,
             )?;
         }
-        let emissive_factor = emissive_factor_bytes(asset.material.emissive_factor);
+        let parameters = material_parameter_bytes(asset.material.parameters);
         picasso.put_embedded_asset(
-            &prepared_asset_key(asset.name, "material/emissive-factor.f32le"),
-            &emissive_factor,
+            &prepared_asset_key(asset.name, "material/parameters.f32le"),
+            &parameters,
         )?;
     }
     Ok(())
 }
 
-fn emissive_factor_bytes(factor: [f32; 3]) -> [u8; 12] {
-    let mut bytes = [0; 12];
-    for (channel, value) in factor.into_iter().enumerate() {
-        let offset = channel * core::mem::size_of::<f32>();
+fn material_parameter_bytes(parameters: RetainedMaterialParameters) -> [u8; 64] {
+    let mut bytes = [0; 64];
+    let values = parameters
+        .base_color_factor
+        .into_iter()
+        .chain(parameters.emissive_factor)
+        .chain([
+            parameters.normal_scale,
+            parameters.metallic_factor,
+            parameters.roughness_factor,
+            parameters.occlusion_strength,
+            parameters.alpha_cutoff,
+        ]);
+    for (component, value) in values.enumerate() {
+        let offset = component * core::mem::size_of::<f32>();
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    for (component, value) in core::iter::once(parameters.flags)
+        .chain(parameters.reserved)
+        .enumerate()
+    {
+        let offset = 48 + component * core::mem::size_of::<u32>();
         bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
     bytes
+}
+
+fn material_parameters_from_bytes(bytes: &[u8]) -> Option<RetainedMaterialParameters> {
+    let bytes: &[u8; 64] = bytes.try_into().ok()?;
+    let words: [u32; 16] = core::array::from_fn(|component| {
+        let offset = component * 4;
+        u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+    });
+    Some(RetainedMaterialParameters {
+        base_color_factor: core::array::from_fn(|component| f32::from_bits(words[component])),
+        emissive_factor: core::array::from_fn(|component| f32::from_bits(words[4 + component])),
+        normal_scale: f32::from_bits(words[7]),
+        metallic_factor: f32::from_bits(words[8]),
+        roughness_factor: f32::from_bits(words[9]),
+        occlusion_strength: f32::from_bits(words[10]),
+        alpha_cutoff: f32::from_bits(words[11]),
+        flags: words[12],
+        reserved: [words[13], words[14], words[15]],
+    })
+}
+
+#[cfg(test)]
+mod material_parameter_tests {
+    use super::{
+        RetainedMaterialParameters, material_parameter_bytes, material_parameters_from_bytes,
+    };
+
+    #[test]
+    fn distinct_material_parameters_survive_picasso_database_serialization() {
+        let parameters = RetainedMaterialParameters {
+            base_color_factor: [0.1, 0.2, 0.3, 0.4],
+            emissive_factor: [0.5, 0.6, 0.7],
+            normal_scale: 0.8,
+            metallic_factor: 0.9,
+            roughness_factor: 0.25,
+            occlusion_strength: 0.75,
+            alpha_cutoff: 0.45,
+            flags: 4,
+            reserved: [0; 3],
+        };
+        let picasso = trueos_picasso::Picasso::new().unwrap();
+        let bytes = material_parameter_bytes(parameters);
+        picasso
+            .put_embedded_asset("material/parameters.f32le", &bytes)
+            .unwrap();
+        let restored = picasso
+            .embedded_asset("material/parameters.f32le")
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.len(), 64);
+        assert_eq!(material_parameters_from_bytes(&restored), Some(parameters));
+        assert!(material_parameters_from_bytes(&restored[..63]).is_none());
+    }
 }
 
 fn load_prepared_assets(
@@ -1290,15 +1383,12 @@ fn load_prepared_assets(
             };
             material_bytes.push(bytes);
         }
-        let Some(emissive_factor_bytes) = picasso.embedded_asset(&prepared_asset_key(
-            asset.name,
-            "material/emissive-factor.f32le",
-        ))?
+        let Some(parameter_bytes) =
+            picasso.embedded_asset(&prepared_asset_key(asset.name, "material/parameters.f32le"))?
         else {
             return Ok(None);
         };
-        let Ok(emissive_factor_bytes) = <&[u8; 12]>::try_from(emissive_factor_bytes.as_slice())
-        else {
+        let Some(parameters) = material_parameters_from_bytes(&parameter_bytes) else {
             return Ok(None);
         };
         assets.push(DatabasePreparedAsset {
@@ -1310,14 +1400,7 @@ fn load_prepared_assets(
                 emissive: material_bytes.remove(0),
                 occlusion: material_bytes.remove(0),
                 normal: material_bytes.remove(0),
-                emissive_factor: core::array::from_fn(|channel| {
-                    let offset = channel * core::mem::size_of::<f32>();
-                    f32::from_le_bytes(
-                        emissive_factor_bytes[offset..offset + 4]
-                            .try_into()
-                            .expect("three f32 factor bytes"),
-                    )
-                }),
+                parameters,
             },
         });
     }
@@ -1521,7 +1604,7 @@ mod tests {
             );
             assert_eq!(
                 asset.vertex_stride,
-                if asset.sampled_material { 32 } else { 24 }
+                if asset.sampled_material { 48 } else { 24 }
             );
             assert!(!asset.primitives.is_empty());
             for primitive in asset.primitives {
@@ -1569,7 +1652,7 @@ mod tests {
         );
         assert_eq!(
             primitive.vertices.byte_length,
-            HELMET_POSITIONS.len() as u64
+            HELMET_POSNORMAL.len() as u64
         );
         assert_eq!(
             primitive.indices.unwrap().byte_length,
