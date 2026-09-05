@@ -448,10 +448,53 @@ fn generate_tangents(
     let mut tangents = vec![[0.0; 4]; positions.len()];
     let mut initialized = vec![false; positions.len()];
     let mut variants = BTreeMap::<(u32, [u32; 4]), u32>::new();
-    for (index, tangent) in indices.iter_mut().zip(corners) {
+    for (index, mut tangent) in indices.iter_mut().zip(corners) {
         assert!(tangent.into_iter().all(f32::is_finite));
         assert!(tangent[3] == 1.0 || tangent[3] == -1.0);
         let source_index = *index as usize;
+        // A collapsed UV triangle has no defined tangent direction. Mikk can
+        // return zero or its default axis there (the helmet contains both).
+        // Preserve every valid Mikk frame, and give only the undefined case
+        // a unit direction perpendicular to the authored normal so fragment
+        // normalization cannot introduce NaNs.
+        let length_squared = tangent[..3].iter().map(|v| v * v).sum::<f32>();
+        let normal = normals[source_index];
+        let normal_length = normal.into_iter().map(|v| v * v).sum::<f32>();
+        assert!(normal_length.is_finite() && normal_length > 1e-20);
+        let dot = normal
+            .into_iter()
+            .zip(tangent)
+            .map(|(n, t)| n * t)
+            .sum::<f32>();
+        if length_squared <= 1e-20 || dot.abs() > 1e-4 || (length_squared - 1.0).abs() > 1e-4 {
+            let mut direction = core::array::from_fn::<_, 3, _>(|component| {
+                tangent[component] - normal[component] * dot / normal_length
+            });
+            if direction.into_iter().map(|v| v * v).sum::<f32>() <= 1e-20 {
+                let axis =
+                    if normal[0].abs() <= normal[1].abs() && normal[0].abs() <= normal[2].abs() {
+                        [1.0, 0.0, 0.0]
+                    } else if normal[1].abs() <= normal[2].abs() {
+                        [0.0, 1.0, 0.0]
+                    } else {
+                        [0.0, 0.0, 1.0]
+                    };
+                direction = [
+                    normal[1] * axis[2] - normal[2] * axis[1],
+                    normal[2] * axis[0] - normal[0] * axis[2],
+                    normal[0] * axis[1] - normal[1] * axis[0],
+                ];
+            }
+            let inverse_length = direction
+                .into_iter()
+                .map(|v| v * v)
+                .sum::<f32>()
+                .sqrt()
+                .recip();
+            for component in 0..3 {
+                tangent[component] = direction[component] * inverse_length;
+            }
+        }
         let key = (*index, tangent.map(f32::to_bits));
         let vertex = if let Some(&vertex) = variants.get(&key) {
             vertex
@@ -701,7 +744,10 @@ mod tests {
                 .map(|(n, t)| n * t)
                 .sum::<f32>();
             let length = tangent.into_iter().map(|t| t * t).sum::<f32>();
-            assert!(dot.abs() < 1e-3, "nonorthogonal tangent: {dot}");
+            assert!(
+                dot.abs() < 1e-3,
+                "nonorthogonal tangent at {index}: {dot}; normal={normal:?} tangent={tangent:?}"
+            );
             assert!((length - 1.0).abs() < 1e-3, "nonunit tangent: {length}");
             assert!(component(vertex, 11).abs() == 1.0);
         }
