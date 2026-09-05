@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Host tests for the actual asset bake and Picasso database handoff.
+"""Host tests for Picasso assets, database handoff, and frame admission.
 
 The Blueprint binary cannot link the host test runner. This temporary Cargo
-crate imports the production build script and pure parameter serialization,
-then runs their Rust tests against Picasso's real in-memory redb backend.
+crate imports production bake, serialization, and frame-admission code, then
+runs their Rust tests with Picasso's real in-memory redb backend.
 """
 
 from pathlib import Path
@@ -21,7 +21,7 @@ BLUEPRINTS = ROOT.parent / "TRUEOS-Blueprints"
 def item(path: Path, name: str) -> str:
     source = path.read_text()
     matches = list(re.finditer(
-        rf"^(?:pub(?:\([^)]*\))?\s+)?(?:fn|struct|mod)\s+{re.escape(name)}\b",
+        rf"^(?:pub(?:\([^)]*\))?\s+)?(?:fn|struct|enum|mod)\s+{re.escape(name)}\b",
         source, re.MULTILINE,
     ))
     if len(matches) != 1:
@@ -46,6 +46,12 @@ def main() -> None:
         + item(runtime, "material_parameter_bytes")
         + item(runtime, "material_parameters_from_bytes")
         + item(runtime, "material_parameter_tests")
+        + item(BLUEPRINTS / "api/src/ui4_solara_text.rs", "Error").replace(
+            "pub enum Error", "pub enum Ui4Error", 1
+        )
+        + item(runtime, "GeometryProbeError")
+        + item(runtime, "render_admitted_frame")
+        + item(runtime, "frame_admission_tests")
     )
     with tempfile.TemporaryDirectory(prefix="picasso-material-tests-") as temporary:
         directory = Path(temporary)

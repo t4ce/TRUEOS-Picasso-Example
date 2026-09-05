@@ -372,6 +372,7 @@ pub struct GeometryProbe {
     timeline: u64,
     previous_elapsed_millis: u64,
     previous_view_projection: [f32; 16],
+    deferred_frames: u64,
 }
 
 #[derive(Default)]
@@ -511,6 +512,7 @@ impl GeometryProbe {
             timeline: 0,
             previous_elapsed_millis: 0,
             previous_view_projection,
+            deferred_frames: 0,
         };
         // Move the Blender-style editor camera, never the world objects.
         probe.flycam.set_look_sensitivity(FLYCAM_LOOK_SENSITIVITY);
@@ -561,12 +563,16 @@ impl GeometryProbe {
             }
             probe.material_textures[slot] = material;
         }
-        probe.render_frame(0)?;
+        while !probe.render_frame(0)? {
+            vsys::poll_once();
+            vsys::sleep_ms(16);
+        }
         Ok(probe)
     }
 
-    /// Advance the camera/compact transform state and render one complete frame.
-    pub fn render_frame(&mut self, elapsed_millis: u64) -> Result<(), GeometryProbeError> {
+    /// Advance input and return whether a complete frame was rendered. A busy
+    /// back buffer defers this frame without submitting or losing the last view.
+    pub fn render_frame(&mut self, elapsed_millis: u64) -> Result<bool, GeometryProbeError> {
         let delta_seconds =
             elapsed_millis.saturating_sub(self.previous_elapsed_millis) as f32 * 0.001;
         self.previous_elapsed_millis = elapsed_millis;
@@ -584,61 +590,85 @@ impl GeometryProbe {
             self.previous_view_projection,
         );
 
-        self.frame
-            .begin_gpu_frame()
-            .map_err(|error| GeometryProbeError::Ui4("frame-begin", error))?;
-        let surface = self
-            .device
-            .acquire_ui4_surface(self.frame.window_id())
-            .map_err(|code| GeometryProbeError::Vgpu("surface-acquire", code))?;
-        let mesh = self.retained_meshes[self.selected_asset].ok_or(GeometryProbeError::Contract)?;
-        let vertices =
-            self.asset_vertex_buffers[self.selected_asset].ok_or(GeometryProbeError::Contract)?;
-        let indices =
-            self.asset_index_buffers[self.selected_asset].ok_or(GeometryProbeError::Contract)?;
-        let submit = RetainedFrameSubmit {
-            camera,
-            material: RetainedMaterial {
-                textures: retained_material_texture_ids(
-                    &self.material_textures[self.selected_asset],
-                    ASSETS[self.selected_asset].sampled_material,
-                ),
-                // V2 carries every scalar in material_parameters;
-                // the legacy scalar stays zero to avoid ambiguity.
-                emissive_factor: [0.0; 3],
-                ..RetainedMaterial::default()
-            },
-            clear_rgba8_srgb: u32::from_le_bytes([0, 128, 0, 0]),
-            seed_count: retained_seed_count(ASSETS[self.selected_asset].helmet_program),
-            seeds: retained_seeds(elapsed_millis, ASSETS[self.selected_asset].helmet_program),
-            ..RetainedFrameSubmit::default()
-        };
-        let point = if ASSETS[self.selected_asset].sampled_material {
-            self.device.submit_retained_frame_v2(
-                self.queue,
-                surface,
-                mesh,
-                vertices,
-                indices,
-                RetainedFrameSubmitV2 {
-                    frame: submit,
-                    material_parameters: self.material_parameters[self.selected_asset],
+        let admission = self.frame.begin_gpu_frame();
+        let rendered = render_admitted_frame(admission, || {
+            let surface = self
+                .device
+                .acquire_ui4_surface(self.frame.window_id())
+                .map_err(|code| GeometryProbeError::Vgpu("surface-acquire", code))?;
+            let mesh = self.retained_meshes[self.selected_asset].ok_or(GeometryProbeError::Contract)?;
+            let vertices =
+                self.asset_vertex_buffers[self.selected_asset].ok_or(GeometryProbeError::Contract)?;
+            let indices =
+                self.asset_index_buffers[self.selected_asset].ok_or(GeometryProbeError::Contract)?;
+            let submit = RetainedFrameSubmit {
+                camera,
+                material: RetainedMaterial {
+                    textures: retained_material_texture_ids(
+                        &self.material_textures[self.selected_asset],
+                        ASSETS[self.selected_asset].sampled_material,
+                    ),
+                    // V2 carries every scalar in material_parameters;
+                    // the legacy scalar stays zero to avoid ambiguity.
+                    emissive_factor: [0.0; 3],
+                    ..RetainedMaterial::default()
                 },
-            )
-        } else {
+                clear_rgba8_srgb: u32::from_le_bytes([0, 128, 0, 0]),
+                seed_count: retained_seed_count(ASSETS[self.selected_asset].helmet_program),
+                seeds: retained_seeds(elapsed_millis, ASSETS[self.selected_asset].helmet_program),
+                ..RetainedFrameSubmit::default()
+            };
+            let point = if ASSETS[self.selected_asset].sampled_material {
+                self.device.submit_retained_frame_v2(
+                    self.queue,
+                    surface,
+                    mesh,
+                    vertices,
+                    indices,
+                    RetainedFrameSubmitV2 {
+                        frame: submit,
+                        material_parameters: self.material_parameters[self.selected_asset],
+                    },
+                )
+            } else {
+                self.device
+                    .submit_retained_frame(self.queue, surface, mesh, vertices, indices, submit)
+            }
+            .map_err(|code| GeometryProbeError::Vgpu("retained-frame-submit", code))?;
             self.device
-                .submit_retained_frame(self.queue, surface, mesh, vertices, indices, submit)
+                .wait(self.queue, point.value)
+                .map_err(|code| GeometryProbeError::Vgpu("timeline-wait", code))?;
+            self.frame
+                .publish(Damage::full(width, height))
+                .map_err(|error| GeometryProbeError::Ui4("frame-publish", error))?;
+            self.timeline = point.value;
+            self.previous_view_projection = camera.view_projection;
+            Ok(())
+        })?;
+        if rendered {
+            if self.deferred_frames != 0 {
+                logl::log(
+                    level::INFO,
+                    format_args!(
+                        "PicassoExample: frame buffer resumed deferred_frames={} timeline={}",
+                        self.deferred_frames, self.timeline,
+                    ),
+                );
+                self.deferred_frames = 0;
+            }
+        } else {
+            self.deferred_frames = self.deferred_frames.saturating_add(1);
+            if self.deferred_frames == 1 || self.deferred_frames % 120 == 0 {
+                logl::log(
+                    level::INFO,
+                    format_args!(
+                        "PicassoExample: frame buffer busy; frame deferred count={} timeline={}",
+                        self.deferred_frames, self.timeline,
+                    ),
+                );
+            }
         }
-        .map_err(|code| GeometryProbeError::Vgpu("retained-frame-submit", code))?;
-        self.device
-            .wait(self.queue, point.value)
-            .map_err(|code| GeometryProbeError::Vgpu("timeline-wait", code))?;
-        self.frame
-            .publish(Damage::full(width, height))
-            .map_err(|error| GeometryProbeError::Ui4("frame-publish", error))?;
-        self.timeline = point.value;
-        self.previous_view_projection = camera.view_projection;
-        Ok(())
+        Ok(rendered)
     }
 
     fn service_asset_hotkeys(&mut self) -> Result<(), GeometryProbeError> {
@@ -1036,6 +1066,59 @@ pub enum GeometryProbeError {
     Contract,
     Ui4(&'static str, Ui4Error),
     Vgpu(&'static str, i32),
+}
+
+/// Backpressure is recoverable only before the frame write lease is acquired.
+/// Once admitted, every rendering error retains its normal failure semantics.
+fn render_admitted_frame(
+    admission: Result<(), Ui4Error>,
+    render: impl FnOnce() -> Result<(), GeometryProbeError>,
+) -> Result<bool, GeometryProbeError> {
+    match admission {
+        Ok(()) => render().map(|()| true),
+        Err(Ui4Error::Busy) => Ok(false),
+        Err(error) => Err(GeometryProbeError::Ui4("frame-begin", error)),
+    }
+}
+
+#[cfg(test)]
+mod frame_admission_tests {
+    use super::{GeometryProbeError, Ui4Error, render_admitted_frame};
+
+    #[test]
+    fn busy_frame_defers_submission_and_success_retires_once() {
+        let mut timeline = 7;
+        let mut previous_view = 3;
+        for admission in [Err(Ui4Error::Busy), Err(Ui4Error::Busy), Ok(())] {
+            let rendered = render_admitted_frame(admission, || {
+                timeline += 1;
+                previous_view = 4;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(rendered, admission.is_ok());
+            assert_eq!(timeline, if rendered { 8 } else { 7 });
+            assert_eq!(previous_view, if rendered { 4 } else { 3 });
+        }
+    }
+
+    #[test]
+    fn other_admission_errors_remain_fatal_without_submission() {
+        for error in [Ui4Error::NotFound, Ui4Error::InvalidState, Ui4Error::Ui4] {
+            let result = render_admitted_frame(Err(error), || panic!("lease not acquired"));
+            assert_eq!(result, Err(GeometryProbeError::Ui4("frame-begin", error)));
+        }
+    }
+
+    #[test]
+    fn errors_after_acquiring_a_lease_are_never_treated_as_deferral() {
+        for error in [
+            GeometryProbeError::Vgpu("retained-frame-submit", -16),
+            GeometryProbeError::Ui4("frame-publish", Ui4Error::Busy),
+        ] {
+            assert_eq!(render_admitted_frame(Ok(()), || Err(error)), Err(error));
+        }
+    }
 }
 
 fn write_exact(device: Device, buffer: Buffer, offset: u64, bytes: &[u8]) -> Result<(), i32> {
