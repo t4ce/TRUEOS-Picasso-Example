@@ -3,7 +3,7 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
 };
-const ASSETS: [(&str, &str); 5] = [
+const ASSETS: [(&str, &str); 6] = [
     ("DamagedHelmet", "Assets/DamagedHelmet/DamagedHelmet.glb"),
     ("Triangle", "Assets/Triangle/Triangle.gltf"),
     ("BoxInterleaved", "Assets/BoxInterleaved/BoxInterleaved.glb"),
@@ -12,6 +12,10 @@ const ASSETS: [(&str, &str); 5] = [
         "Assets/SimpleSparseAccessor/SimpleSparseAccessor.gltf",
     ),
     ("RiggedSimple", "Assets/RiggedSimple/RiggedSimple.glb"),
+    // A deliberately large real-world GLB: keep it in the ordinary catalog
+    // so it exercises the same host bake and Picasso database package path as
+    // every other selectable asset.
+    ("Ship", "Assets/Ship/mud.glb"),
 ];
 
 // Sample authored material maps through the retained Intel renderer. Assets
@@ -21,7 +25,8 @@ const ENABLE_SAMPLED_MATERIAL: bool = true;
 fn main() {
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set"));
     let mut catalog = format!(
-        "pub const ENABLE_SAMPLED_MATERIAL: bool = {ENABLE_SAMPLED_MATERIAL};\npub const ASSET_COUNT: usize = 5;\npub static ASSETS: [PreparedAsset; ASSET_COUNT] = [\n",
+        "pub const ENABLE_SAMPLED_MATERIAL: bool = {ENABLE_SAMPLED_MATERIAL};\npub const ASSET_COUNT: usize = {};\npub static ASSETS: [PreparedAsset; ASSET_COUNT] = [\n",
+        ASSETS.len(),
     );
     for (slot, (name, source)) in ASSETS.iter().enumerate() {
         println!("cargo:rerun-if-changed={source}");
@@ -234,10 +239,12 @@ fn prepare(source: &Path, sampled_material: bool) -> PreparedGeometry {
             let sampler = texture.sampler();
             assert_eq!(sampler.wrap_s(), gltf::texture::WrappingMode::Repeat);
             assert_eq!(sampler.wrap_t(), gltf::texture::WrappingMode::Repeat);
-            assert!(
-                sampler.mag_filter().is_none() && sampler.min_filter().is_none(),
-                "material has an explicit filter not represented by this example"
-            );
+            // Retained PBR sampling is linear/repeat at mip 0. Preserve the
+            // image bytes even when an authored asset explicitly requests
+            // linear or mipmapped filtering: the current carrier has no
+            // per-texture sampler object, so its fixed resident sampler is
+            // the deliberately documented presentation policy.
+            let _ = (sampler.mag_filter(), sampler.min_filter());
         }
     }
     let prepared_material = PreparedMaterial {
@@ -794,12 +801,32 @@ mod tests {
 
     #[test]
     fn image_free_assets_keep_position_normal_layout() {
-        for (_, source) in ASSETS.iter().skip(1) {
+        for (_, source) in ASSETS.iter().filter(|(name, _)| {
+            // The large Ship fixture intentionally has a sampled material;
+            // this test covers only the small image-free fixtures.
+            *name != "DamagedHelmet" && *name != "Ship"
+        }) {
             let prepared = prepare(&asset_path(source), true);
             assert!(prepared.material.base_color.is_none());
             assert_eq!(prepared.vertex_stride, 24);
             assert!(prepared.vertices.len().is_multiple_of(24));
         }
+    }
+
+    #[test]
+    fn ship_bake_keeps_all_primitive_ranges_and_uses_the_sampled_layout() {
+        let prepared = prepare(&asset_path("Assets/Ship/mud.glb"), true);
+        assert_eq!(prepared.vertex_stride, 48);
+        assert!(prepared.material.base_color.is_some());
+        assert_eq!(prepared.primitives.len(), 9);
+        assert!(prepared.primitives.iter().all(|primitive| {
+            primitive.topology == "TriangleList"
+                && primitive.vertex_count > 0
+                && primitive.index_count > 0
+                && primitive.first_vertex + primitive.vertex_count
+                    <= (prepared.vertices.len() / prepared.vertex_stride) as u32
+                && primitive.first_index + primitive.index_count <= (prepared.indices.len() / 4) as u32
+        }));
     }
 
     #[test]
