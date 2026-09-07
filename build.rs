@@ -3,7 +3,7 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
 };
-const ASSETS: [(&str, &str); 6] = [
+const ASSETS: [(&str, &str); 5] = [
     ("DamagedHelmet", "Assets/DamagedHelmet/DamagedHelmet.glb"),
     ("Triangle", "Assets/Triangle/Triangle.gltf"),
     ("BoxInterleaved", "Assets/BoxInterleaved/BoxInterleaved.glb"),
@@ -12,10 +12,6 @@ const ASSETS: [(&str, &str); 6] = [
         "Assets/SimpleSparseAccessor/SimpleSparseAccessor.gltf",
     ),
     ("RiggedSimple", "Assets/RiggedSimple/RiggedSimple.glb"),
-    // A deliberately large real-world GLB: keep it in the ordinary catalog
-    // so it exercises the same host bake and Picasso database package path as
-    // every other selectable asset.
-    ("Ship", "Assets/Ship/mud.glb"),
 ];
 
 // Sample authored material maps through the retained Intel renderer. Assets
@@ -802,31 +798,13 @@ mod tests {
     #[test]
     fn image_free_assets_keep_position_normal_layout() {
         for (_, source) in ASSETS.iter().filter(|(name, _)| {
-            // The large Ship fixture intentionally has a sampled material;
-            // this test covers only the small image-free fixtures.
-            *name != "DamagedHelmet" && *name != "Ship"
+            *name != "DamagedHelmet"
         }) {
             let prepared = prepare(&asset_path(source), true);
             assert!(prepared.material.base_color.is_none());
             assert_eq!(prepared.vertex_stride, 24);
             assert!(prepared.vertices.len().is_multiple_of(24));
         }
-    }
-
-    #[test]
-    fn ship_bake_keeps_all_primitive_ranges_and_uses_the_sampled_layout() {
-        let prepared = prepare(&asset_path("Assets/Ship/mud.glb"), true);
-        assert_eq!(prepared.vertex_stride, 48);
-        assert!(prepared.material.base_color.is_some());
-        assert_eq!(prepared.primitives.len(), 9);
-        assert!(prepared.primitives.iter().all(|primitive| {
-            primitive.topology == "TriangleList"
-                && primitive.vertex_count > 0
-                && primitive.index_count > 0
-                && primitive.first_vertex + primitive.vertex_count
-                    <= (prepared.vertices.len() / prepared.vertex_stride) as u32
-                && primitive.first_index + primitive.index_count <= (prepared.indices.len() / 4) as u32
-        }));
     }
 
     #[test]

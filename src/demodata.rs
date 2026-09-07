@@ -8,7 +8,7 @@ pub struct DemoAsset {
     pub bytes: &'static [u8],
 }
 
-pub static ASSETS: [DemoAsset; 6] = [
+pub static ASSETS: [DemoAsset; 5] = [
     DemoAsset {
         name: "Triangle",
         bytes: include_bytes!(concat!(
@@ -43,9 +43,5 @@ pub static ASSETS: [DemoAsset; 6] = [
             env!("CARGO_MANIFEST_DIR"),
             "/Assets/DamagedHelmet/DamagedHelmet.glb"
         )),
-    },
-    DemoAsset {
-        name: "Ship",
-        bytes: include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/Assets/Ship/mud.glb")),
     },
 ];
