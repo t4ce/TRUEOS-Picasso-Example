@@ -1614,7 +1614,7 @@ fn run() {
     logl::log(
         level::INFO,
         format_args!(
-            "PicassoExample: flycam enabled controls=WASD+middle_drag local_quaternion_look=1 speed={:.1} sensitivity={:.4}",
+            "PicassoExample: flycam enabled controls=WASD+QE-roll+middle_drag local_quaternion_look=1 speed={:.1} sensitivity={:.4}",
             FLYCAM_SPEED, FLYCAM_LOOK_SENSITIVITY,
         ),
     );
