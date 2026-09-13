@@ -7,6 +7,7 @@
 extern crate alloc;
 
 mod demodata;
+mod video_demo;
 
 use alloc::{format, string::String, vec::Vec};
 use trueos::ui4_scene::{
@@ -365,6 +366,8 @@ pub struct GeometryProbe {
     material_textures: [ResidentMaterial; ASSET_COUNT],
     material_parameters: [RetainedMaterialParameters; ASSET_COUNT],
     retained_meshes: [Option<RetainedMesh>; ASSET_COUNT],
+    video_demo: Option<video_demo::Demo>,
+    video_retry_at: u64,
     selected_asset: usize,
     number_keys: u8,
     flycam: FlyCam,
@@ -505,6 +508,8 @@ impl GeometryProbe {
                 catalog.assets[slot].material.parameters
             }),
             retained_meshes,
+            video_demo: None,
+            video_retry_at: 0,
             selected_asset: 0,
             number_keys: 0,
             flycam: FlyCam::new(camera, FLYCAM_SPEED),
@@ -517,6 +522,7 @@ impl GeometryProbe {
         // Move the Blender-style editor camera, never the world objects.
         probe.flycam.set_look_sensitivity(FLYCAM_LOOK_SENSITIVITY);
         for (slot, asset) in ASSETS.iter().enumerate() {
+            if asset.helmet_program { continue; }
             let runtime_material = &catalog.assets[slot].material;
             // Keep the bundle local until every requested decode has reached
             // the owner-scoped Render1 carrier. Any error drops the completed
@@ -590,6 +596,39 @@ impl GeometryProbe {
             self.previous_view_projection,
         );
 
+        if ASSETS[self.selected_asset].helmet_program {
+            if self.video_demo.is_none() {
+                self.video_demo = Some(video_demo::Demo::open(self.device)
+                    .map_err(|e| GeometryProbeError::Vgpu("video-mesh", e))?);
+            }
+            let demo = self.video_demo.as_mut().unwrap();
+            if !demo.running() {
+                let now = clock::monotonic_millis();
+                if now < self.video_retry_at { return Ok(false); }
+                match demo.start() {
+                    Ok(()) => logl::log(level::INFO, format_args!("PicassoExample: video streams=3 sizes=48,128,256 quads=4 shared=48 path=vdbox+guc+retained-unlit")),
+                    Err(-4) => {
+                        self.video_retry_at = now.saturating_add(1000);
+                        logl::log(level::INFO, format_args!("PicassoExample: waiting for three shared video slots; other asset keys remain available"));
+                        return Ok(false);
+                    }
+                    Err(code) => return Err(GeometryProbeError::Vgpu("video-open", code)),
+                }
+            }
+            if !demo.poll().map_err(|e| GeometryProbeError::Vgpu("video-poll", e))? { return Ok(false); }
+            return render_admitted_frame(self.frame.begin_gpu_frame(), || {
+                let surface = self.device.acquire_ui4_surface(self.frame.window_id())
+                    .map_err(|e| GeometryProbeError::Vgpu("video-surface", e))?;
+                let point = demo.render(self.queue, surface, camera)
+                    .map_err(|e| GeometryProbeError::Vgpu("video-render", e))?;
+                self.frame.publish(Damage::full(width, height))
+                    .map_err(|e| GeometryProbeError::Ui4("video-publish", e))?;
+                self.timeline = point.value;
+                self.previous_view_projection = camera.view_projection;
+                Ok(())
+            });
+        }
+        if let Some(demo) = self.video_demo.as_mut() { demo.stop(); }
         let admission = self.frame.begin_gpu_frame();
         let rendered = render_admitted_frame(admission, || {
             let surface = self
@@ -696,7 +735,7 @@ impl GeometryProbe {
                     format_args!(
                         "PicassoExample: asset hotkey={} selected={} vertices={} indices={} instances={}",
                         slot + 1,
-                        ASSETS[slot].name,
+                        if ASSETS[slot].helmet_program { "VideoQuads" } else { ASSETS[slot].name },
                         ASSETS[slot].vertex_count,
                         ASSETS[slot].index_count,
                         if ASSETS[slot].helmet_program { 4 } else { 1 }
@@ -1600,14 +1639,8 @@ fn run() {
     logl::log(
         level::INFO,
         format_args!(
-            "PicassoExample: retained DamagedHelmet material bundle submitted and retired: vertices={} indices={} base_color_bound={} emissive_resident={} metallic_roughness_resident={} occlusion_resident={} normal_resident={} timeline={}",
-            HELMET_VERTEX_COUNT,
-            HELMET_INDEX_COUNT,
-            probe.material_textures[0].base_color.is_some() as u8,
-            probe.material_textures[0].emissive.is_some() as u8,
-            probe.material_textures[0].metallic_roughness.is_some() as u8,
-            probe.material_textures[0].occlusion.is_some() as u8,
-            probe.material_textures[0].normal.is_some() as u8,
+            "PicassoExample: initial retained view submitted and retired asset={} timeline={}",
+            if ASSETS[probe.selected_asset].helmet_program { "VideoQuads" } else { ASSETS[probe.selected_asset].name },
             probe.timeline(),
         ),
     );

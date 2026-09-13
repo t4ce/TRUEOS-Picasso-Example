@@ -1,0 +1,38 @@
+[
+  {
+    "file": "DSC_1879_48_a.mp4",
+    "sha256": "122f45cabca903cce6dd645f9423881a77dd965e88ccf94255202585d018ee47",
+    "codec_name": "h264",
+    "profile": "High",
+    "width": 48,
+    "height": 48,
+    "color_range": "pc",
+    "color_space": "bt709",
+    "r_frame_rate": "60000/1001",
+    "nb_frames": "1071"
+  },
+  {
+    "file": "DSC_1879_128_a.mp4",
+    "sha256": "f538e7f7720b51586e90b40164f9a517e9b4e447918e85749baf919c4ed7d77e",
+    "codec_name": "h264",
+    "profile": "High",
+    "width": 128,
+    "height": 128,
+    "color_range": "pc",
+    "color_space": "bt709",
+    "r_frame_rate": "60000/1001",
+    "nb_frames": "1071"
+  },
+  {
+    "file": "DSC_1879_256_a.mp4",
+    "sha256": "5bce96eef29fa4b9c97059d5dd303548334ddfea7846eb62d188368849462394",
+    "codec_name": "h264",
+    "profile": "High",
+    "width": 256,
+    "height": 256,
+    "color_range": "pc",
+    "color_space": "bt709",
+    "r_frame_rate": "60000/1001",
+    "nb_frames": "1071"
+  }
+]
