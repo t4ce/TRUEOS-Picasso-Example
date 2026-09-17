@@ -4,8 +4,10 @@ The initial view (key 1, formerly four DamagedHelmet instances) now shows four
 quads. They play the embedded `DSC_1879_48_a.mp4`, `DSC_1879_128_a.mp4`, and
 `DSC_1879_256_a.mp4`; the fourth quad shares the first stream. The clips retain
 MP4 presentation timestamps, B-frames, and full-range BT.709 metadata. Audio is
-not played. Other asset views and the existing camera/window controls remain.
-Leaving this view drops the three streams. Returning starts them again.
+not played. The prepared DamagedHelmet GLB remains available on key 6 through
+the normal retained/PBR asset path. Other asset views and the existing
+camera/window controls remain. Leaving the video view drops the three streams.
+Returning starts them again.
 
 This requires the matching kernel and Blueprint SDK changes. New imports are
 strictly additive: `trueos_cabi_vmedia_video_command_v1` and

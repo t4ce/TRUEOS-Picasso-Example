@@ -3,7 +3,7 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
 };
-const ASSETS: [(&str, &str); 5] = [
+const ASSETS: [(&str, &str); 6] = [
     ("DamagedHelmet", "Assets/DamagedHelmet/DamagedHelmet.glb"),
     ("Triangle", "Assets/Triangle/Triangle.gltf"),
     ("BoxInterleaved", "Assets/BoxInterleaved/BoxInterleaved.glb"),
@@ -12,6 +12,7 @@ const ASSETS: [(&str, &str); 5] = [
         "Assets/SimpleSparseAccessor/SimpleSparseAccessor.gltf",
     ),
     ("RiggedSimple", "Assets/RiggedSimple/RiggedSimple.glb"),
+    ("DamagedHelmetGLB", "Assets/DamagedHelmet/DamagedHelmet.glb"),
 ];
 
 // Sample authored material maps through the retained Intel renderer. Assets
@@ -797,8 +798,8 @@ mod tests {
 
     #[test]
     fn image_free_assets_keep_position_normal_layout() {
-        for (_, source) in ASSETS.iter().filter(|(name, _)| {
-            *name != "DamagedHelmet"
+        for (_, source) in ASSETS.iter().filter(|(_, source)| {
+            *source != "Assets/DamagedHelmet/DamagedHelmet.glb"
         }) {
             let prepared = prepare(&asset_path(source), true);
             assert!(prepared.material.base_color.is_none());
